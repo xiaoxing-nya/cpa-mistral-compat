@@ -168,8 +168,34 @@ var forbiddenTopLevelFields = []string{
 
 var messageReasoningFields = []string{"reasoning_content", "reasoning", "reasoning_text", "reasoning_details"}
 
+// restrictedReasoningEffortLevels lists only models with explicitly constrained wire-level values.
+// Unknown models remain pass-through; no requested level is ever remapped to another level.
+var restrictedReasoningEffortLevels = []struct {
+	modelPattern string
+	levels       []string
+}{
+	{modelPattern: "deepseek-v4?1?flash*", levels: []string{"none", "low", "high", "max"}},
+	{modelPattern: "mistral-large-4*", levels: []string{"low", "medium", "high"}},
+}
+
+func isReasoningEffortSupported(model, effort string) bool {
+	model = stripThinkingSuffix(model)
+	for _, capability := range restrictedReasoningEffortLevels {
+		if !matchPattern(capability.modelPattern, model) {
+			continue
+		}
+		for _, level := range capability.levels {
+			if effort == level {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
 // TransformMistralChatRequest performs pure wire-format normalization from OpenAI Chat Completions to Mistral Chat Completions.
-// It never alters reasoning_effort values; model-level capability/tier validation is left to CPA and the upstream API.
+// It preserves supported reasoning_effort values and omits known-unsupported ones so the upstream model uses its default.
 func TransformMistralChatRequest(body []byte, cfg Config) ([]byte, bool) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
@@ -216,9 +242,15 @@ func TransformMistralChatRequest(body []byte, cfg Config) ([]byte, bool) {
 		}
 	}
 
-	// 4. Protocol mutual exclusion: Mistral rejects requests containing both reasoning_effort and prompt_mode
+	// 4. Drop only known-unsupported efforts (upstream default); otherwise preserve protocol mutual exclusion.
 	if reRaw, hasRE := root["reasoning_effort"]; hasRE && string(bytes.TrimSpace(reRaw)) != "null" {
-		if _, hasPM := root["prompt_mode"]; hasPM {
+		var model, effort string
+		_ = json.Unmarshal(root["model"], &model)
+		_ = json.Unmarshal(reRaw, &effort)
+		if !isReasoningEffortSupported(model, effort) {
+			delete(root, "reasoning_effort")
+			changed = true
+		} else if _, hasPM := root["prompt_mode"]; hasPM {
 			delete(root, "prompt_mode")
 			changed = true
 		}

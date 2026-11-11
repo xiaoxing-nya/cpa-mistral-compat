@@ -107,6 +107,47 @@ func TestTransformMistralChatRequest_PureWireFormat(t *testing.T) {
 	}
 }
 
+func TestTransformMistralChatRequest_UnsupportedReasoningEffortUsesUpstreamDefault(t *testing.T) {
+	tests := []struct {
+		name        string
+		model       string
+		effort      string
+		wantPresent bool
+	}{
+		{name: "DeepSeek medium falls back to model default", model: "deepseek-v4-1-flash-1017", effort: "medium", wantPresent: false},
+		{name: "DeepSeek auto also falls back instead of sending invalid wire value", model: "deepseek-v4.1-flash", effort: "auto", wantPresent: false},
+		{name: "DeepSeek supported high stays untouched", model: "deepseek-v4-1-flash-1017", effort: "high", wantPresent: true},
+		{name: "Mistral Large supported medium stays untouched", model: "mistral-large-4", effort: "medium", wantPresent: true},
+		{name: "unknown model capabilities stay untouched", model: "future-model", effort: "medium", wantPresent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"model": tt.model, "reasoning_effort": tt.effort,
+				"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, changed := TransformMistralChatRequest(raw, DefaultConfig())
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("unmarshal output: %v", err)
+			}
+			value, present := got["reasoning_effort"]
+			if present != tt.wantPresent {
+				t.Fatalf("reasoning_effort presence = %v (value %v), want %v; output: %s", present, value, tt.wantPresent, out)
+			}
+			if present && value != tt.effort {
+				t.Fatalf("reasoning_effort = %v, want untouched %q", value, tt.effort)
+			}
+			if changed == tt.wantPresent {
+				t.Fatalf("changed = %v, want %v", changed, !tt.wantPresent)
+			}
+		})
+	}
+}
+
 func TestTransformMistralResponse_StreamAndNonStream(t *testing.T) {
 	nonStream := []byte(`{
 		"id": "cmpl-1",
