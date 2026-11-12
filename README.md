@@ -1,4 +1,4 @@
-# cpa-mistral-compat (v0.2.1)
+# cpa-mistral-compat (v0.2.2)
 
 CLIProxyAPI (CPA) 专用 Mistral **协议格式（Wire-Format）**双向兼容插件。
 

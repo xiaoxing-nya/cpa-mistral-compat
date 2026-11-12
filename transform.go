@@ -174,8 +174,24 @@ var restrictedReasoningEffortLevels = []struct {
 	modelPattern string
 	levels       []string
 }{
-	{modelPattern: "deepseek-v4?1?flash*", levels: []string{"none", "low", "high", "max"}},
+	// DeepSeek: supports none, low, high, xhigh, max.
+	{modelPattern: "*deepseek*", levels: []string{"none", "low", "high", "xhigh", "max"}},
+
+	// GLM (zai-glm-5-3, glm-5.3, etc.): supports low, high, max (none is NOT supported).
+	{modelPattern: "*glm-5?3*", levels: []string{"low", "high", "max"}},
+	{modelPattern: "*zai-glm*", levels: []string{"low", "high", "max"}},
+
+	// Mistral Large 4 supports low, medium, high.
 	{modelPattern: "mistral-large-4*", levels: []string{"low", "medium", "high"}},
+
+	// Mistral Small 4 and Mistral Medium 3.5 support none and high.
+	{modelPattern: "mistral-small-2603*", levels: []string{"none", "high"}},
+	{modelPattern: "mistral-small-4*", levels: []string{"none", "high"}},
+	{modelPattern: "mistral-medium-3-5*", levels: []string{"none", "high"}},
+
+	// Legacy Mistral Large models (mistral-large-latest, 2407, 2411) do not support reasoning_effort.
+	// Dropping reasoning_effort prevents upstream "reasoning_effort is not enabled for this model" errors.
+	{modelPattern: "mistral-large*", levels: []string{}},
 }
 
 func isReasoningEffortSupported(model, effort string) bool {

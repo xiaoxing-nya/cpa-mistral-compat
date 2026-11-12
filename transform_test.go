@@ -117,7 +117,16 @@ func TestTransformMistralChatRequest_UnsupportedReasoningEffortUsesUpstreamDefau
 		{name: "DeepSeek medium falls back to model default", model: "deepseek-v4-1-flash-1017", effort: "medium", wantPresent: false},
 		{name: "DeepSeek auto also falls back instead of sending invalid wire value", model: "deepseek-v4.1-flash", effort: "auto", wantPresent: false},
 		{name: "DeepSeek supported high stays untouched", model: "deepseek-v4-1-flash-1017", effort: "high", wantPresent: true},
-		{name: "Mistral Large supported medium stays untouched", model: "mistral-large-4", effort: "medium", wantPresent: true},
+		{name: "DeepSeek supported xhigh stays untouched", model: "deepseek-v4-1-flash-1017", effort: "xhigh", wantPresent: true},
+		{name: "GLM supported max stays untouched", model: "zai-glm-5-3", effort: "max", wantPresent: true},
+		{name: "GLM supported low stays untouched", model: "glm-5.3", effort: "low", wantPresent: true},
+		{name: "GLM none is unsupported and falls back", model: "zai-glm-5-3", effort: "none", wantPresent: false},
+		{name: "GLM medium is unsupported and falls back", model: "glm-5.3-flash", effort: "medium", wantPresent: false},
+		{name: "Mistral Large 4 supported medium stays untouched", model: "mistral-large-4", effort: "medium", wantPresent: true},
+		{name: "Legacy Mistral Large drops any effort", model: "mistral-large-latest", effort: "high", wantPresent: false},
+		{name: "Legacy Mistral Large 2411 drops any effort", model: "mistral-large-2411", effort: "low", wantPresent: false},
+		{name: "Mistral Small 4 supported high stays untouched", model: "mistral-small-2603", effort: "high", wantPresent: true},
+		{name: "Mistral Medium 3.5 unsupported medium falls back", model: "mistral-medium-3-5", effort: "medium", wantPresent: false},
 		{name: "unknown model capabilities stay untouched", model: "future-model", effort: "medium", wantPresent: true},
 	}
 	for _, tt := range tests {

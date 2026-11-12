@@ -19,7 +19,7 @@ const (
 	abiVersion    uint32 = 1
 	schemaVersion uint32 = 7
 	pluginName           = "cpa-mistral-compat"
-	pluginVersion        = "0.2.1"
+	pluginVersion        = "0.2.2"
 )
 
 type envelope struct {
