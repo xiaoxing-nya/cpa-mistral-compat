@@ -77,6 +77,7 @@ var (
 
 	discoveredMu     sync.RWMutex
 	discoveredModels = map[string]bool{}
+	nonMistralModels = map[string]bool{} // models confirmed on non-Mistral credentials
 	lastDiscovery    time.Time
 )
 
@@ -310,12 +311,37 @@ func checkTargetAndRemember(model, requestedModel, callbackID string, body []byt
 	if callbackID != "" {
 		refreshDiscoveredMistralModels(callbackID, cfg)
 	}
+	// Hard exclusion: a model confirmed on a non-Mistral credential is never processed,
+	// regardless of pattern matches. This prevents the plugin from breaking requests
+	// routed to other channels that happen to share model names or pattern prefixes.
+	if isNonMistralModel(model) || isNonMistralModel(requestedModel) {
+		return false
+	}
 	matched := IsMistralTarget(model, requestedModel, "", body, cfg) || isDiscoveredMistralModel(model, requestedModel)
 	if matched {
 		rememberDiscoveredModel(model)
 		rememberDiscoveredModel(requestedModel)
 	}
 	return matched
+}
+
+func isNonMistralModel(model string) bool {
+	if model == "" {
+		return false
+	}
+	discoveredMu.RLock()
+	defer discoveredMu.RUnlock()
+	c := strings.ToLower(strings.TrimSpace(stripThinkingSuffix(model)))
+	if c == "" {
+		return false
+	}
+	if nonMistralModels[c] {
+		return true
+	}
+	if slash := strings.IndexByte(c, '/'); slash >= 0 {
+		return nonMistralModels[c[slash+1:]]
+	}
+	return false
 }
 
 func handleMethod(method string, reqBytes []byte) ([]byte, error) {
@@ -514,10 +540,17 @@ func refreshDiscoveredMistralModels(callbackID string, cfg Config) {
 	defer discoveredMu.Unlock()
 	lastDiscovery = time.Now()
 	for _, c := range modelsResp.Credentials {
-		if mistralAuthIDs[c.ID] || mistralAuthIDs[c.AuthIndex] || isMistralProviderKey(c.Provider, "", cfg) {
-			for _, m := range c.Models {
-				if trimmed := strings.ToLower(strings.TrimSpace(m)); trimmed != "" {
+		isMistralCred := mistralAuthIDs[c.ID] || mistralAuthIDs[c.AuthIndex] || isMistralProviderKey(c.Provider, "", cfg)
+		for _, m := range c.Models {
+			if trimmed := strings.ToLower(strings.TrimSpace(m)); trimmed != "" {
+				if isMistralCred {
 					discoveredModels[trimmed] = true
+				} else {
+					// Track models on non-Mistral credentials so the plugin never
+					// touches requests routed to other channels, even if a pattern
+					// would nominally match the model name.
+					nonMistralModels[trimmed] = true
+					delete(discoveredModels, trimmed)
 				}
 			}
 		}
@@ -532,11 +565,22 @@ func isDiscoveredMistralModel(model, requestedModel string) bool {
 		if c == "" {
 			continue
 		}
+		// A model confirmed on a non-Mistral credential is never a Mistral target,
+		// even if it was previously remembered or matches a broad pattern.
+		if nonMistralModels[c] {
+			return false
+		}
 		if discoveredModels[c] {
 			return true
 		}
-		if slash := strings.IndexByte(c, '/'); slash >= 0 && discoveredModels[c[slash+1:]] {
-			return true
+		if slash := strings.IndexByte(c, '/'); slash >= 0 {
+			base := c[slash+1:]
+			if nonMistralModels[base] {
+				return false
+			}
+			if discoveredModels[base] {
+				return true
+			}
 		}
 	}
 	return false
