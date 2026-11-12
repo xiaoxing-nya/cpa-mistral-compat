@@ -177,8 +177,14 @@ var restrictedReasoningEffortLevels = []struct {
 	// DeepSeek: supports none, low, high, xhigh, max.
 	{modelPattern: "*deepseek*", levels: []string{"none", "low", "high", "xhigh", "max"}},
 
-	// GLM (zai-glm-5-3, glm-5.3, etc.): supports low, high, max (none is NOT supported).
+	// GLM 5.2 (zai-glm-5-2, glm-5-2, glm-5.2): supports none, high, max (low is NOT supported).
+	// Must come before *zai-glm* so zai-glm-5-2 gets the correct 5.2 levels, not the 5.3 fallback.
+	{modelPattern: "*glm-5?2*", levels: []string{"none", "high", "max"}},
+
+	// GLM 5.3 and GLM 5.3 Flash (zai-glm-5-3, zai-glm-5-3-flash, glm-5.3, etc.): supports low, high, max (none is NOT supported).
 	{modelPattern: "*glm-5?3*", levels: []string{"low", "high", "max"}},
+
+	// Fallback for other zai-glm aliases (zai-glm-5, zai-glm-latest → GLM 5.3 levels).
 	{modelPattern: "*zai-glm*", levels: []string{"low", "high", "max"}},
 
 	// Mistral Large 4 supports low, medium, high.
