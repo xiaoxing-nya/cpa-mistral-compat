@@ -55,7 +55,7 @@ func TestTransformMistralChatRequest_PureWireFormat(t *testing.T) {
 		]
 	}`)
 
-	out, changed := TransformMistralChatRequest(raw, cfg)
+	out, changed := TransformMistralChatRequest(raw, "", cfg)
 	if !changed {
 		t.Fatal("expected request to be changed")
 	}
@@ -109,10 +109,11 @@ func TestTransformMistralChatRequest_PureWireFormat(t *testing.T) {
 
 func TestTransformMistralChatRequest_UnsupportedReasoningEffortUsesUpstreamDefault(t *testing.T) {
 	tests := []struct {
-		name        string
-		model       string
-		effort      string
-		wantPresent bool
+		name          string
+		model         string
+		envelopeModel string
+		effort        string
+		wantPresent   bool
 	}{
 		{name: "DeepSeek medium falls back to model default", model: "deepseek-v4-1-flash-1017", effort: "medium", wantPresent: false},
 		{name: "DeepSeek auto also falls back instead of sending invalid wire value", model: "deepseek-v4.1-flash", effort: "auto", wantPresent: false},
@@ -152,7 +153,7 @@ func TestTransformMistralChatRequest_UnsupportedReasoningEffortUsesUpstreamDefau
 			if err != nil {
 				t.Fatal(err)
 			}
-			out, changed := TransformMistralChatRequest(raw, DefaultConfig())
+			out, changed := TransformMistralChatRequest(raw, tt.envelopeModel, DefaultConfig())
 			var got map[string]any
 			if err := json.Unmarshal(out, &got); err != nil {
 				t.Fatalf("unmarshal output: %v", err)
@@ -167,6 +168,51 @@ func TestTransformMistralChatRequest_UnsupportedReasoningEffortUsesUpstreamDefau
 			if changed == tt.wantPresent {
 				t.Fatalf("changed = %v, want %v", changed, !tt.wantPresent)
 			}
+		})
+	}
+}
+
+func TestTransformMistralChatRequest_AliasFallsBackToEnvelopeModel(t *testing.T) {
+	tests := []struct {
+		name          string
+		bodyModel     string
+		envelopeModel string
+		effort        string
+		wantPresent   bool
+	}{
+		{name: "custom alias + GLM 5.3 upstream: none should drop", bodyModel: "my-custom-glm", envelopeModel: "zai-glm-5-3", effort: "none", wantPresent: false},
+		{name: "custom alias + GLM 5.3 upstream: low should keep", bodyModel: "my-custom-glm", envelopeModel: "zai-glm-5-3", effort: "low", wantPresent: true},
+		{name: "custom alias + GLM 5.2 upstream: low should drop", bodyModel: "vibe-glm", envelopeModel: "zai-glm-5-2", effort: "low", wantPresent: false},
+		{name: "custom alias + GLM 5.2 upstream: none should keep", bodyModel: "vibe-glm", envelopeModel: "zai-glm-5-2", effort: "none", wantPresent: true},
+		{name: "custom alias + DeepSeek upstream: medium should drop", bodyModel: "ds-flash", envelopeModel: "deepseek-v4-1-flash-1017", effort: "medium", wantPresent: false},
+		{name: "custom alias + DeepSeek upstream: xhigh should keep", bodyModel: "ds-flash", envelopeModel: "deepseek-v4-1-flash-1017", effort: "xhigh", wantPresent: true},
+		{name: "custom alias + legacy Mistral Large: any effort should drop", bodyModel: "big-model", envelopeModel: "mistral-large-latest", effort: "high", wantPresent: false},
+		{name: "body model matches pattern: envelope model ignored", bodyModel: "zai-glm-5-3", envelopeModel: "some-other-model", effort: "none", wantPresent: false},
+		{name: "both models unknown: pass-through", bodyModel: "custom-a", envelopeModel: "custom-b", effort: "medium", wantPresent: true},
+		{name: "empty envelope model: body model only", bodyModel: "zai-glm-5-3", envelopeModel: "", effort: "none", wantPresent: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"model": tt.bodyModel, "reasoning_effort": tt.effort,
+				"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, changed := TransformMistralChatRequest(raw, tt.envelopeModel, DefaultConfig())
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("unmarshal output: %v", err)
+			}
+			value, present := got["reasoning_effort"]
+			if present != tt.wantPresent {
+				t.Fatalf("reasoning_effort presence = %v (value %v), want %v; output: %s", present, value, tt.wantPresent, out)
+			}
+			if present && value != tt.effort {
+				t.Fatalf("reasoning_effort = %v, want untouched %q", value, tt.effort)
+			}
+			_ = changed
 		})
 	}
 }

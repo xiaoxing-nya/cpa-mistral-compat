@@ -200,25 +200,33 @@ var restrictedReasoningEffortLevels = []struct {
 	{modelPattern: "mistral-large*", levels: []string{}},
 }
 
-func isReasoningEffortSupported(model, effort string) bool {
+// resolveReasoningEffortSupport returns the supported levels and whether the model matched a restricted pattern.
+func resolveReasoningEffortSupport(model string) ([]string, bool) {
 	model = stripThinkingSuffix(model)
 	for _, capability := range restrictedReasoningEffortLevels {
-		if !matchPattern(capability.modelPattern, model) {
-			continue
+		if matchPattern(capability.modelPattern, model) {
+			return capability.levels, true
 		}
-		for _, level := range capability.levels {
-			if effort == level {
-				return true
-			}
-		}
-		return false
 	}
-	return true
+	return nil, false
+}
+
+func isReasoningEffortSupported(model, effort string) bool {
+	levels, matched := resolveReasoningEffortSupport(model)
+	if !matched {
+		return true
+	}
+	for _, level := range levels {
+		if effort == level {
+			return true
+		}
+	}
+	return false
 }
 
 // TransformMistralChatRequest performs pure wire-format normalization from OpenAI Chat Completions to Mistral Chat Completions.
 // It preserves supported reasoning_effort values and omits known-unsupported ones so the upstream model uses its default.
-func TransformMistralChatRequest(body []byte, cfg Config) ([]byte, bool) {
+func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) ([]byte, bool) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return body, false
@@ -269,6 +277,12 @@ func TransformMistralChatRequest(body []byte, cfg Config) ([]byte, bool) {
 		var model, effort string
 		_ = json.Unmarshal(root["model"], &model)
 		_ = json.Unmarshal(reRaw, &effort)
+		// Body model takes priority; fall back to envelope model (upstream ID) for custom aliases.
+		if _, matched := resolveReasoningEffortSupport(model); !matched && envelopeModel != "" && envelopeModel != model {
+			if _, envMatched := resolveReasoningEffortSupport(envelopeModel); envMatched {
+				model = envelopeModel
+			}
+		}
 		if !isReasoningEffortSupported(model, effort) {
 			delete(root, "reasoning_effort")
 			changed = true

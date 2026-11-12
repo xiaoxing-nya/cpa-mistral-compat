@@ -358,7 +358,7 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 		if !checkTargetAndRemember(req.Model, "", "", req.Body, cfg) {
 			return okEnvelope(payloadResp{})
 		}
-		if out, changed := TransformMistralChatRequest(req.Body, cfg); changed {
+		if out, changed := TransformMistralChatRequest(req.Body, req.Model, cfg); changed {
 			return okEnvelope(payloadResp{Body: out})
 		}
 		return okEnvelope(payloadResp{})
