@@ -596,6 +596,32 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 			changed = true
 		}
 	}
+	if rfRaw, hasRF := root["response_format"]; hasRF {
+		var rf map[string]json.RawMessage
+		if json.Unmarshal(rfRaw, &rf) == nil && rf != nil {
+			if jsRaw, hasJS := rf["json_schema"]; hasJS && string(bytes.TrimSpace(jsRaw)) != "null" {
+				var js map[string]json.RawMessage
+				if json.Unmarshal(jsRaw, &js) == nil && js != nil {
+					jsChanged := false
+					if strictRaw, hasStrict := js["strict"]; hasStrict && string(bytes.TrimSpace(strictRaw)) == "null" {
+						delete(js, "strict")
+						jsChanged = true
+					}
+					if schemaRaw, hasSchema := js["schema"]; hasSchema && string(bytes.TrimSpace(schemaRaw)) != "null" {
+						if normSchema, sChg := normalizeToolParametersSchema(schemaRaw); sChg {
+							js["schema"] = normSchema
+							jsChanged = true
+						}
+					}
+					if jsChanged {
+						rf["json_schema"], _ = json.Marshal(js)
+						root["response_format"], _ = json.Marshal(rf)
+						changed = true
+					}
+				}
+			}
+		}
+	}
 	if stRaw, hasST := root["service_tier"]; hasST {
 		if string(bytes.TrimSpace(stRaw)) != "null" {
 			var st string
@@ -802,9 +828,43 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 			delete(p, "cache_control")
 			changed = true
 		}
-		if pType := jsonStringValue(p["type"]); pType == "input_text" {
+		switch jsonStringValue(p["type"]) {
+		case "input_text":
 			p["type"] = json.RawMessage(`"text"`)
 			changed = true
+		case "file":
+			var fileObj struct {
+				Filename string `json:"filename"`
+				FileData string `json:"file_data"`
+				FileURL  string `json:"file_url"`
+			}
+			if fRaw, ok := p["file"]; ok {
+				_ = json.Unmarshal(fRaw, &fileObj)
+			}
+			docURL := strings.TrimSpace(fileObj.FileData)
+			if docURL == "" {
+				docURL = strings.TrimSpace(fileObj.FileURL)
+			}
+			if docURL == "" {
+				var topData, topURL string
+				_ = json.Unmarshal(p["file_data"], &topData)
+				_ = json.Unmarshal(p["file_url"], &topURL)
+				docURL = strings.TrimSpace(topData)
+				if docURL == "" {
+					docURL = strings.TrimSpace(topURL)
+				}
+			}
+			if docURL != "" {
+				p["type"] = json.RawMessage(`"document_url"`)
+				p["document_url"], _ = json.Marshal(docURL)
+				if name := strings.TrimSpace(fileObj.Filename); name != "" {
+					p["document_name"], _ = json.Marshal(name)
+				}
+				delete(p, "file")
+				delete(p, "file_data")
+				delete(p, "file_url")
+				changed = true
+			}
 		}
 	}
 	if !changed {

@@ -12,7 +12,8 @@ CLIProxyAPI (CPA) 专用 Mistral **协议格式（Wire-Format）**双向兼容�
    - 历史 `assistant` 消息中的 `reasoning_content` / `reasoning` / `reasoning_details` -> 转换为 Mistral 原生 `{"type":"thinking","closed":true,...}` 内容块回传；
    - `tool_call_id` 确定性哈希归一化为 9 位字母数字 `[A-Za-z0-9]{9}`；
    - 修正 `assistant.prefix` 约束；
-   - 递归将 Gemini 工具参数中的全大写类型（`OBJECT`/`STRING` 等）及 `nullable` 规范化为标准 JSON Schema。
+   - 递归将 Gemini 工具参数及 `response_format.json_schema.schema` 中的全大写类型（`OBJECT`/`STRING` 等）及 `nullable` 规范化为标准 JSON Schema（同时清除 `strict: null`）；
+   - 将跨协议文档附件 `type: "file"` 转换为 Mistral 原生 `type: "document_url"`。
 4. **基于选中凭证的精准隔离（不与其他渠道打架）**：
    通过 `host.auth.list` + `host.auth.models` 识别 Mistral 凭证的 `id` / `auth_index`，并在 `request.intercept_after` 校验宿主传入的 `selected_auth_id` / `selected_auth_index`（`before` 阶段保持 `omit_body_before: true` 零拷贝）。非 Mistral 凭证（如 `cline-pass` 等）的请求哪怕模型名或别名完全相同也会零改动直接放行。
 5. **不支持的推理档位自动使用上游默认值**：

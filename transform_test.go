@@ -641,3 +641,71 @@ func TestTransformMistralResponse_PrettyPrintedMultilineJSON(t *testing.T) {
 		t.Fatalf("unexpected message: %s", out)
 	}
 }
+
+func TestTransformMistralChatRequest_StructuredOutputSchemaAndFileToDocumentURL(t *testing.T) {
+	raw := []byte(`{
+		"model": "mistral-large-4",
+		"response_format": {
+			"type": "json_schema",
+			"json_schema": {
+				"name": "answer",
+				"strict": null,
+				"schema": {
+					"type": "OBJECT",
+					"properties": {
+						"ok": {"type": "BOOLEAN"},
+						"note": {"type": "STRING", "nullable": true}
+					},
+					"required": ["ok"]
+				}
+			}
+		},
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "Read this PDF"},
+					{"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,JVBERi0xLjQK"}},
+					{"type": "file", "file": {"file_url": "https://example.com/a.pdf"}}
+				]
+			}
+		]
+	}`)
+	out, changed := TransformMistralChatRequest(raw, "mistral-large-4", DefaultConfig())
+	if !changed {
+		t.Fatal("expected request to be changed")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	js := got["response_format"].(map[string]any)["json_schema"].(map[string]any)
+	if _, hasStrict := js["strict"]; hasStrict {
+		t.Fatalf("expected null strict removed from response_format.json_schema: %s", out)
+	}
+	schema := js["schema"].(map[string]any)
+	if schema["type"] != "object" {
+		t.Fatalf("expected uppercase schema.type normalized to 'object', got %v", schema["type"])
+	}
+	props := schema["properties"].(map[string]any)
+	if props["ok"].(map[string]any)["type"] != "boolean" {
+		t.Fatalf("expected ok.type='boolean', got %v", props["ok"])
+	}
+	noteTypes, ok := props["note"].(map[string]any)["type"].([]any)
+	if !ok || len(noteTypes) != 2 || noteTypes[0] != "string" || noteTypes[1] != "null" {
+		t.Fatalf("expected nullable note normalized to [string null], got %v", props["note"])
+	}
+
+	parts := got["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	p1 := parts[1].(map[string]any)
+	if p1["type"] != "document_url" || p1["document_url"] != "data:application/pdf;base64,JVBERi0xLjQK" || p1["document_name"] != "doc.pdf" {
+		t.Fatalf("expected file part converted to document_url with document_name, got %v", p1)
+	}
+	if _, hasFile := p1["file"]; hasFile {
+		t.Fatalf("expected legacy file key removed: %v", p1)
+	}
+	p2 := parts[2].(map[string]any)
+	if p2["type"] != "document_url" || p2["document_url"] != "https://example.com/a.pdf" {
+		t.Fatalf("expected file_url part converted to document_url, got %v", p2)
+	}
+}
