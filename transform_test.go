@@ -3,13 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
 func TestTransformMistralChatRequest_PureWireFormat(t *testing.T) {
 	cfg := DefaultConfig()
 	raw := []byte(`{
-		"model": "mistral-small-latest",
+		"model": "mistral-large-4",
 		"store": false,
 		"seed": 12345,
 		"user": "user_99",
@@ -129,16 +130,17 @@ func TestTransformMistralChatRequest_UnsupportedReasoningEffortUsesUpstreamDefau
 		{name: "GLM 5.2 zai-id supported none stays untouched", model: "zai-glm-5-2", effort: "none", wantPresent: true},
 		{name: "GLM 5.2 zai-id supported high stays untouched", model: "zai-glm-5-2", effort: "high", wantPresent: true},
 		{name: "GLM 5.2 zai-id supported max stays untouched", model: "zai-glm-5-2", effort: "max", wantPresent: true},
-		{name: "GLM 5.2 zai-id low is unsupported and falls back", model: "zai-glm-5-2", effort: "low", wantPresent: false},
-		{name: "GLM 5.2 zai-id medium is unsupported and falls back", model: "zai-glm-5-2", effort: "medium", wantPresent: false},
+		{name: "GLM 5.2 zai-id low is now supported and kept", model: "zai-glm-5-2", effort: "low", wantPresent: true},
+		{name: "GLM 5.2 zai-id medium is now supported and kept", model: "zai-glm-5-2", effort: "medium", wantPresent: true},
 		{name: "GLM 5.2 alias-id supported none stays untouched", model: "glm-5-2", effort: "none", wantPresent: true},
-		{name: "GLM 5.2 alias-id low is unsupported and falls back", model: "glm-5-2", effort: "low", wantPresent: false},
+		{name: "GLM 5.2 alias-id low is now supported and kept", model: "glm-5-2", effort: "low", wantPresent: true},
 		{name: "GLM 5.2 dot-alias supported high stays untouched", model: "glm-5.2", effort: "high", wantPresent: true},
 		{name: "GLM latest alias supported low stays untouched", model: "zai-glm-latest", effort: "low", wantPresent: true},
 		{name: "GLM latest alias none is unsupported and falls back", model: "zai-glm-latest", effort: "none", wantPresent: false},
 		{name: "GLM 5 alias supported high stays untouched", model: "zai-glm-5", effort: "high", wantPresent: true},
 		{name: "Mistral Large 4 supported medium stays untouched", model: "mistral-large-4", effort: "medium", wantPresent: true},
-		{name: "Legacy Mistral Large drops any effort", model: "mistral-large-latest", effort: "high", wantPresent: false},
+		{name: "Mistral Large latest maps to Large 4 and keeps medium", model: "mistral-large-latest", effort: "medium", wantPresent: true},
+		{name: "Legacy Mistral Large 2512 drops any effort", model: "mistral-large-2512", effort: "high", wantPresent: false},
 		{name: "Legacy Mistral Large 2411 drops any effort", model: "mistral-large-2411", effort: "low", wantPresent: false},
 		{name: "Mistral Small 4 supported high stays untouched", model: "mistral-small-2603", effort: "high", wantPresent: true},
 		{name: "Mistral Medium 3.5 unsupported medium falls back", model: "mistral-medium-3-5", effort: "medium", wantPresent: false},
@@ -182,11 +184,11 @@ func TestTransformMistralChatRequest_AliasFallsBackToEnvelopeModel(t *testing.T)
 	}{
 		{name: "custom alias + GLM 5.3 upstream: none should drop", bodyModel: "my-custom-glm", envelopeModel: "zai-glm-5-3", effort: "none", wantPresent: false},
 		{name: "custom alias + GLM 5.3 upstream: low should keep", bodyModel: "my-custom-glm", envelopeModel: "zai-glm-5-3", effort: "low", wantPresent: true},
-		{name: "custom alias + GLM 5.2 upstream: low should drop", bodyModel: "vibe-glm", envelopeModel: "zai-glm-5-2", effort: "low", wantPresent: false},
+		{name: "custom alias + GLM 5.2 upstream: auto should drop", bodyModel: "vibe-glm", envelopeModel: "zai-glm-5-2", effort: "auto", wantPresent: false},
 		{name: "custom alias + GLM 5.2 upstream: none should keep", bodyModel: "vibe-glm", envelopeModel: "zai-glm-5-2", effort: "none", wantPresent: true},
 		{name: "custom alias + DeepSeek upstream: medium should drop", bodyModel: "ds-flash", envelopeModel: "deepseek-v4-1-flash-1017", effort: "medium", wantPresent: false},
 		{name: "custom alias + DeepSeek upstream: xhigh should keep", bodyModel: "ds-flash", envelopeModel: "deepseek-v4-1-flash-1017", effort: "xhigh", wantPresent: true},
-		{name: "custom alias + legacy Mistral Large: any effort should drop", bodyModel: "big-model", envelopeModel: "mistral-large-latest", effort: "high", wantPresent: false},
+		{name: "custom alias + legacy Mistral Large 2512: any effort should drop", bodyModel: "big-model", envelopeModel: "mistral-large-2512", effort: "high", wantPresent: false},
 		{name: "body model matches pattern: envelope model ignored", bodyModel: "zai-glm-5-3", envelopeModel: "some-other-model", effort: "none", wantPresent: false},
 		{name: "both models unknown: pass-through", bodyModel: "custom-a", envelopeModel: "custom-b", effort: "medium", wantPresent: true},
 		{name: "empty envelope model: body model only", bodyModel: "zai-glm-5-3", envelopeModel: "", effort: "none", wantPresent: false},
@@ -256,10 +258,10 @@ func TestTransformMistralResponse_StreamAndNonStream(t *testing.T) {
 }
 
 func TestTransformMistralChatRequest_EnvelopeModelOverridesConflictingAlias(t *testing.T) {
-	// Client aliases GLM 5.2 (supports none/high/max, NOT low) as "glm-5.3" (which allows low).
+	// Client aliases GLM 5.3 (supports low/high/max, NOT none) as "glm-5.2" (which allows none).
 	// Upstream envelope model MUST take priority over client alias.
-	raw := []byte(`{"model":"glm-5.3","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
-	out, changed := TransformMistralChatRequest(raw, "zai-glm-5-2", DefaultConfig())
+	raw := []byte(`{"model":"glm-5.2","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}`)
+	out, changed := TransformMistralChatRequest(raw, "zai-glm-5-3", DefaultConfig())
 	if !changed {
 		t.Fatal("expected request to be changed")
 	}
@@ -268,7 +270,7 @@ func TestTransformMistralChatRequest_EnvelopeModelOverridesConflictingAlias(t *t
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if _, hasRE := got["reasoning_effort"]; hasRE {
-		t.Fatalf("expected low reasoning_effort to be stripped for zai-glm-5-2, got %s", out)
+		t.Fatalf("expected none reasoning_effort to be stripped for zai-glm-5-3, got %s", out)
 	}
 }
 
@@ -464,5 +466,178 @@ func TestTransformMistralChatRequest_DoesNotDuplicateExistingThinkingBlockInCont
 	}
 	if thinkingCount != 1 {
 		t.Fatalf("expected exactly 1 thinking block, got %d: %s", thinkingCount, out)
+	}
+}
+
+func TestTransformMistralChatRequest_MistralCatalogEffortCoverage(t *testing.T) {
+	cases := []struct {
+		name       string
+		model      string
+		effort     string
+		wantKept   bool
+		wantEffort string
+	}{
+		// GLM 5.2 now supports none/minimal/low/medium/high/xhigh/max, only rejects auto.
+		{"GLM 5.2 low kept", "zai-glm-5-2", "low", true, "low"},
+		{"GLM 5.2 medium kept", "glm-5-2", "medium", true, "medium"},
+		{"GLM 5.2 xhigh kept", "zai-glm-5-2", "xhigh", true, "xhigh"},
+		{"GLM 5.2 auto dropped", "zai-glm-5-2", "auto", false, ""},
+		// Mistral Medium 3.5 (dot & dash) & latest & Magistral & Vibe: none / high only.
+		{"Mistral Medium 3.5 dot medium dropped", "mistral-medium-3.5", "medium", false, ""},
+		{"Mistral Medium 3.5 dot high kept", "mistral-medium-3.5", "high", true, "high"},
+		{"Mistral Medium latest low dropped", "mistral-medium-latest", "low", false, ""},
+		{"Mistral Medium 2604 none kept", "mistral-medium-2604", "none", true, "none"},
+		{"Mistral Small latest medium dropped", "mistral-small-latest", "medium", false, ""},
+		{"Magistral Medium latest medium dropped", "magistral-medium-latest", "medium", false, ""},
+		{"Magistral Small latest high kept", "magistral-small-latest", "high", true, "high"},
+		{"Mistral Vibe CLI fast low dropped", "mistral-vibe-cli-fast", "low", false, ""},
+		// Codestral / Ministral / Mistral-Code: reasoning_effort disabled.
+		{"Codestral high dropped", "codestral-latest", "high", false, ""},
+		{"Ministral 14b medium dropped", "ministral-14b-latest", "medium", false, ""},
+		{"Mistral Code none dropped", "mistral-code-latest", "none", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(fmt.Sprintf(`{"model":%q,"reasoning_effort":%q,"messages":[{"role":"user","content":"hi"}]}`, tc.model, tc.effort))
+			out, _ := TransformMistralChatRequest(raw, tc.model, DefaultConfig())
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatal(err)
+			}
+			val, exists := got["reasoning_effort"]
+			if tc.wantKept {
+				if !exists || val != tc.wantEffort {
+					t.Fatalf("expected reasoning_effort=%q kept, got exists=%v val=%v out=%s", tc.wantEffort, exists, val, out)
+				}
+			} else if exists {
+				t.Fatalf("expected reasoning_effort stripped, got %v out=%s", val, out)
+			}
+		})
+	}
+}
+
+func TestTransformMistralChatRequest_SanitizesRealWorld422Hazards(t *testing.T) {
+	raw := []byte(`{
+		"model": "zai-glm-5-3",
+		"max_tokens": 32,
+		"max_completion_tokens": null,
+		"stream_options": null,
+		"response_format": null,
+		"parallel_tool_calls": null,
+		"tool_choice": null,
+		"service_tier": "default",
+		"truncation": "auto",
+		"background": false,
+		"previous_response_id": "resp_123",
+		"max_output_tokens": 64,
+		"instructions": "be brief",
+		"include": ["reasoning.encrypted_content"],
+		"conversation": "conv_1",
+		"prompt": {"id": "p1"},
+		"input": "hi",
+		"text": {"format": {"type": "text"}},
+		"audio": {"voice": "alloy", "format": "wav"},
+		"modalities": ["text"],
+		"tools": [{
+			"type": "function",
+			"function": {
+				"name": "ping",
+				"description": null,
+				"strict": null,
+				"parameters": null
+			}
+		}],
+		"messages": [
+			{"role": "system", "content": null},
+			{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+		]
+	}`)
+	out, changed := TransformMistralChatRequest(raw, "zai-glm-5-3", DefaultConfig())
+	if !changed {
+		t.Fatal("expected request to be sanitized")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, mustDrop := range []string{
+		"max_completion_tokens", "stream_options", "response_format", "parallel_tool_calls",
+		"tool_choice", "service_tier", "truncation", "background", "previous_response_id",
+		"max_output_tokens", "instructions", "include", "conversation", "prompt", "input", "text",
+	} {
+		if _, exists := got[mustDrop]; exists {
+			t.Fatalf("expected %q removed, out=%s", mustDrop, out)
+		}
+	}
+	if _, hasAudio := got["audio"]; !hasAudio {
+		t.Fatalf("expected valid Mistral audio field preserved, out=%s", out)
+	}
+	if _, hasMod := got["modalities"]; !hasMod {
+		t.Fatalf("expected valid Mistral modalities field preserved, out=%s", out)
+	}
+	tools := got["tools"].([]any)
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	if _, hasDesc := fn["description"]; hasDesc {
+		t.Fatalf("expected null description removed: %s", out)
+	}
+	if _, hasStrict := fn["strict"]; hasStrict {
+		t.Fatalf("expected null strict removed: %s", out)
+	}
+	if _, hasParams := fn["parameters"].(map[string]any); !hasParams {
+		t.Fatalf("expected default parameters object synthesized when null/missing: %s", out)
+	}
+	msgs := got["messages"].([]any)
+	if msgs[0].(map[string]any)["content"] != "" {
+		t.Fatalf("expected system null content coerced to empty string: %s", out)
+	}
+	uParts := msgs[1].(map[string]any)["content"].([]any)
+	if uParts[0].(map[string]any)["type"] != "text" {
+		t.Fatalf("expected input_text normalized to text: %s", out)
+	}
+}
+
+func TestStripUnsupportedSourceThinking_GeminiSnakeCaseAndClaudeMixedEffort(t *testing.T) {
+	// 1. Gemini snake_case generation_config.thinking_config
+	gBody := []byte(`{"generation_config":{"thinking_config":{"thinking_level":"medium"}},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	gOut, gChg := StripUnsupportedSourceThinking(gBody, "gemini", "zai-glm-5-3", "m-glm53")
+	if !gChg {
+		t.Fatalf("expected snake_case gemini thinking_level stripped: %s", gOut)
+	}
+	var gMap map[string]any
+	_ = json.Unmarshal(gOut, &gMap)
+	gc := gMap["generation_config"].(map[string]any)
+	if _, ok := gc["thinking_config"]; ok {
+		t.Fatalf("expected thinking_config removed: %s", gOut)
+	}
+
+	// 2. Claude with supported thinking budget (16000 -> high) but unsupported output_config.effort ("medium")
+	cBody := []byte(`{"thinking":{"type":"enabled","budget_tokens":16000},"output_config":{"effort":"medium"},"messages":[{"role":"user","content":"hi"}]}`)
+	cOut, cChg := StripUnsupportedSourceThinking(cBody, "claude", "zai-glm-5-3", "m-glm53")
+	if !cChg {
+		t.Fatalf("expected unsupported output_config.effort stripped while keeping supported thinking: %s", cOut)
+	}
+	var cMap map[string]any
+	_ = json.Unmarshal(cOut, &cMap)
+	if _, hasOC := cMap["output_config"]; hasOC {
+		t.Fatalf("expected unsupported output_config removed: %s", cOut)
+	}
+	if _, hasThinking := cMap["thinking"]; !hasThinking {
+		t.Fatalf("expected supported thinking preserved: %s", cOut)
+	}
+}
+
+func TestTransformMistralResponse_PrettyPrintedMultilineJSON(t *testing.T) {
+	raw := []byte("{\n  \"id\": \"1\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"stop\",\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\":\n        [\n          {\"type\": \"thinking\", \"thinking\": [{\"type\": \"text\", \"text\": \"step\"}]},\n          {\"type\": \"text\", \"text\": \"done\"}\n        ]\n      }\n    }\n  ]\n}")
+	out, chg := TransformMistralResponse(raw, false)
+	if !chg {
+		t.Fatalf("expected multiline pretty-printed content array to be transformed")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	msg := got["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "done" || msg["reasoning_content"] != "step" {
+		t.Fatalf("unexpected message: %s", out)
 	}
 }

@@ -161,9 +161,17 @@ var forbiddenTopLevelFields = []string{
 	"user_id",
 	"options",
 	"web_search_options",
-	"audio",
-	"modalities",
 	"logit_bias",
+	"truncation",
+	"background",
+	"previous_response_id",
+	"max_output_tokens",
+	"instructions",
+	"include",
+	"conversation",
+	"prompt",
+	"input",
+	"text",
 }
 
 var messageReasoningFields = []string{"reasoning_content", "reasoning", "reasoning_text", "reasoning_details"}
@@ -177,27 +185,33 @@ var restrictedReasoningEffortLevels = []struct {
 	// DeepSeek: supports none, low, high, xhigh, max.
 	{modelPattern: "*deepseek*", levels: []string{"none", "low", "high", "xhigh", "max"}},
 
-	// GLM 5.2 (zai-glm-5-2, glm-5-2, glm-5.2): supports none, high, max (low is NOT supported).
-	// Must come before *zai-glm* so zai-glm-5-2 gets the correct 5.2 levels, not the 5.3 fallback.
-	{modelPattern: "*glm-5?2*", levels: []string{"none", "high", "max"}},
+	// GLM 5.2 (zai-glm-5-2, glm-5-2, glm-5.2): supports all standard levels except auto.
+	// Must come before *zai-glm* so zai-glm-5-2 does not fall into the 5.3 subset.
+	{modelPattern: "*glm-5?2*", levels: []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}},
 
-	// GLM 5.3 and GLM 5.3 Flash (zai-glm-5-3, zai-glm-5-3-flash, glm-5.3, etc.): supports low, high, max (none is NOT supported).
+	// GLM 5.3 and GLM 5.3 Flash (zai-glm-5-3, zai-glm-5-3-flash, glm-5.3, etc.): supports low, high, max.
 	{modelPattern: "*glm-5?3*", levels: []string{"low", "high", "max"}},
 
 	// Fallback for other zai-glm aliases (zai-glm-5, zai-glm-latest → GLM 5.3 levels).
 	{modelPattern: "*zai-glm*", levels: []string{"low", "high", "max"}},
 
-	// Mistral Large 4 supports low, medium, high.
+	// Mistral Large 4 (mistral-large-4, mistral-large-4-0, mistral-large-latest) supports low, medium, high.
 	{modelPattern: "mistral-large-4*", levels: []string{"low", "medium", "high"}},
+	{modelPattern: "mistral-large-latest", levels: []string{"low", "medium", "high"}},
 
-	// Mistral Small 4 and Mistral Medium 3.5 support none and high.
+	// Mistral Small 4 / Medium 3.x / Magistral / Vibe CLI models support none and high only.
 	{modelPattern: "mistral-small-2603*", levels: []string{"none", "high"}},
 	{modelPattern: "mistral-small-4*", levels: []string{"none", "high"}},
-	{modelPattern: "mistral-medium-3-5*", levels: []string{"none", "high"}},
+	{modelPattern: "mistral-small-latest", levels: []string{"none", "high"}},
+	{modelPattern: "mistral-medium*", levels: []string{"none", "high"}},
+	{modelPattern: "magistral-*", levels: []string{"none", "high"}},
+	{modelPattern: "mistral-vibe-*", levels: []string{"none", "high"}},
 
-	// Legacy Mistral Large models (mistral-large-latest, 2407, 2411) do not support reasoning_effort.
-	// Dropping reasoning_effort prevents upstream "reasoning_effort is not enabled for this model" errors.
+	// Non-reasoning Mistral models (legacy Mistral Large, Codestral, Ministral, Mistral Code).
 	{modelPattern: "mistral-large*", levels: []string{}},
+	{modelPattern: "codestral*", levels: []string{}},
+	{modelPattern: "ministral*", levels: []string{}},
+	{modelPattern: "mistral-code*", levels: []string{}},
 }
 
 // resolveReasoningEffortSupport returns the supported levels and whether the model matched a restricted pattern.
@@ -282,6 +296,91 @@ func jsonIntValue(raw json.RawMessage) (int, bool) {
 // StripUnsupportedSourceThinking strips known-unsupported reasoning effort settings
 // from the source request payload before CPA translates and applies thinking config.
 // Supported efforts and unknown models remain untouched.
+func stripGeminiThinkingInContainer(container map[string]json.RawMessage, targetModel string) bool {
+	if container == nil {
+		return false
+	}
+	changed := false
+	for _, gcKey := range []string{"generationConfig", "generation_config"} {
+		gcRaw, hasGC := container[gcKey]
+		if !hasGC || string(bytes.TrimSpace(gcRaw)) == "null" {
+			continue
+		}
+		var gc map[string]json.RawMessage
+		if json.Unmarshal(gcRaw, &gc) != nil || gc == nil {
+			continue
+		}
+		gcChanged := false
+		for _, tcKey := range []string{"thinkingConfig", "thinking_config"} {
+			tcRaw, hasTC := gc[tcKey]
+			if !hasTC || string(bytes.TrimSpace(tcRaw)) == "null" {
+				continue
+			}
+			var tc map[string]json.RawMessage
+			if json.Unmarshal(tcRaw, &tc) != nil || tc == nil {
+				continue
+			}
+			effectiveEffort := ""
+			for _, lk := range []string{"thinkingLevel", "thinking_level"} {
+				if v := jsonStringValue(tc[lk]); v != "" {
+					effectiveEffort = v
+					break
+				}
+			}
+			if effectiveEffort == "" {
+				for _, bk := range []string{"thinkingBudget", "thinking_budget"} {
+					if bRaw, ok := tc[bk]; ok && string(bytes.TrimSpace(bRaw)) != "null" {
+						if b, okInt := jsonIntValue(bRaw); okInt {
+							if lvl, okLvl := convertBudgetToLevel(b); okLvl {
+								effectiveEffort = lvl
+							}
+						}
+						break
+					}
+				}
+			}
+			if effectiveEffort != "" && !isReasoningEffortSupported(targetModel, effectiveEffort) {
+				tcChanged := false
+				for _, k := range []string{"thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"} {
+					if _, exists := tc[k]; exists {
+						delete(tc, k)
+						tcChanged = true
+					}
+				}
+				if tcChanged {
+					if len(tc) == 0 {
+						delete(gc, tcKey)
+					} else {
+						gc[tcKey], _ = json.Marshal(tc)
+					}
+					gcChanged = true
+				}
+			}
+		}
+		for _, directKey := range []string{"thinkingLevel", "thinking_level"} {
+			if v := jsonStringValue(gc[directKey]); v != "" && !isReasoningEffortSupported(targetModel, v) {
+				delete(gc, directKey)
+				gcChanged = true
+			}
+		}
+		for _, directBKey := range []string{"thinkingBudget", "thinking_budget"} {
+			if bRaw, ok := gc[directBKey]; ok && string(bytes.TrimSpace(bRaw)) != "null" {
+				if b, okInt := jsonIntValue(bRaw); okInt {
+					if lvl, okLvl := convertBudgetToLevel(b); okLvl && !isReasoningEffortSupported(targetModel, lvl) {
+						delete(gc, directBKey)
+						gcChanged = true
+					}
+				}
+			}
+		}
+		if gcChanged {
+			container[gcKey], _ = json.Marshal(gc)
+			changed = true
+		}
+	}
+	return changed
+}
+
 func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedModel string) ([]byte, bool) {
 	if len(body) == 0 {
 		return body, false
@@ -402,51 +501,26 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 					changed = true
 				}
 			}
+		} else if outputEffort != "" && !isReasoningEffortSupported(targetModel, outputEffort) && outCfg != nil {
+			delete(outCfg, "effort")
+			if len(outCfg) == 0 {
+				delete(root, "output_config")
+			} else {
+				root["output_config"], _ = json.Marshal(outCfg)
+			}
+			changed = true
 		}
 
 	case "gemini":
-		if gcRaw, hasGC := root["generationConfig"]; hasGC && string(bytes.TrimSpace(gcRaw)) != "null" {
-			var gc map[string]json.RawMessage
-			if json.Unmarshal(gcRaw, &gc) == nil && gc != nil {
-				if tcRaw, hasTC := gc["thinkingConfig"]; hasTC && string(bytes.TrimSpace(tcRaw)) != "null" {
-					var tc map[string]json.RawMessage
-					if json.Unmarshal(tcRaw, &tc) == nil && tc != nil {
-						effectiveEffort := ""
-						for _, lk := range []string{"thinkingLevel", "thinking_level"} {
-							if v := jsonStringValue(tc[lk]); v != "" {
-								effectiveEffort = v
-								break
-							}
-						}
-						if effectiveEffort == "" {
-							for _, bk := range []string{"thinkingBudget", "thinking_budget"} {
-								if bRaw, ok := tc[bk]; ok && string(bytes.TrimSpace(bRaw)) != "null" {
-									if b, okInt := jsonIntValue(bRaw); okInt {
-										if lvl, okLvl := convertBudgetToLevel(b); okLvl {
-											effectiveEffort = lvl
-										}
-									}
-									break
-								}
-							}
-						}
-						if effectiveEffort != "" && !isReasoningEffortSupported(targetModel, effectiveEffort) {
-							for _, k := range []string{"thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"} {
-								if _, exists := tc[k]; exists {
-									delete(tc, k)
-									changed = true
-								}
-							}
-							if changed {
-								if len(tc) == 0 {
-									delete(gc, "thinkingConfig")
-								} else {
-									gc["thinkingConfig"], _ = json.Marshal(tc)
-								}
-								root["generationConfig"], _ = json.Marshal(gc)
-							}
-						}
-					}
+		if stripGeminiThinkingInContainer(root, targetModel) {
+			changed = true
+		}
+		if reqRaw, hasReq := root["request"]; hasReq && string(bytes.TrimSpace(reqRaw)) != "null" {
+			var reqObj map[string]json.RawMessage
+			if json.Unmarshal(reqRaw, &reqObj) == nil && reqObj != nil {
+				if stripGeminiThinkingInContainer(reqObj, targetModel) {
+					root["request"], _ = json.Marshal(reqObj)
+					changed = true
 				}
 			}
 		}
@@ -489,24 +563,80 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 		}
 	}
 
-	// 3. Sanitize stream_options (Mistral only accepts include_usage; include_obfuscation is rejected)
+	// 3. Sanitize stream_options (Mistral rejects null and unknown keys like include_obfuscation / continuous_usage_stats)
 	if soRaw, ok := root["stream_options"]; ok {
-		var so map[string]json.RawMessage
-		if json.Unmarshal(soRaw, &so) == nil && so != nil {
-			soChanged := false
-			for k := range so {
-				if k != "include_usage" {
-					delete(so, k)
-					soChanged = true
+		if string(bytes.TrimSpace(soRaw)) == "null" {
+			delete(root, "stream_options")
+			changed = true
+		} else {
+			var so map[string]json.RawMessage
+			if json.Unmarshal(soRaw, &so) == nil && so != nil {
+				soChanged := false
+				for k := range so {
+					if k != "include_usage" {
+						delete(so, k)
+						soChanged = true
+					}
+				}
+				if len(so) == 0 {
+					delete(root, "stream_options")
+					changed = true
+				} else if soChanged {
+					root["stream_options"], _ = json.Marshal(so)
+					changed = true
 				}
 			}
-			if len(so) == 0 {
-				delete(root, "stream_options")
-				changed = true
-			} else if soChanged {
-				root["stream_options"], _ = json.Marshal(so)
+		}
+	}
+
+	// 3b. Drop null values on strict Mistral fields and resolve max_tokens/max_completion_tokens conflict
+	for _, nonNullField := range []string{"response_format", "parallel_tool_calls", "tool_choice"} {
+		if rawVal, exists := root[nonNullField]; exists && string(bytes.TrimSpace(rawVal)) == "null" {
+			delete(root, nonNullField)
+			changed = true
+		}
+	}
+	if stRaw, hasST := root["service_tier"]; hasST {
+		if string(bytes.TrimSpace(stRaw)) != "null" {
+			var st string
+			if json.Unmarshal(stRaw, &st) == nil && st != "auto" && st != "standard_only" {
+				delete(root, "service_tier")
 				changed = true
 			}
+		}
+	}
+	if tcRaw, hasTC := root["tool_choice"]; hasTC {
+		var tcStr string
+		if json.Unmarshal(tcRaw, &tcStr) == nil {
+			switch tcStr {
+			case "auto", "none", "any", "required":
+			default:
+				delete(root, "tool_choice")
+				changed = true
+			}
+		} else {
+			var tcObj map[string]json.RawMessage
+			if json.Unmarshal(tcRaw, &tcObj) != nil || jsonStringValue(tcObj["type"]) != "function" {
+				delete(root, "tool_choice")
+				changed = true
+			}
+		}
+	}
+	_, hasMT := root["max_tokens"]
+	mtIsNull := hasMT && string(bytes.TrimSpace(root["max_tokens"])) == "null"
+	mctRaw, hasMCT := root["max_completion_tokens"]
+	mctIsNull := hasMCT && string(bytes.TrimSpace(mctRaw)) == "null"
+	if mtIsNull {
+		delete(root, "max_tokens")
+		changed = true
+	}
+	if hasMCT {
+		if mctIsNull {
+			delete(root, "max_completion_tokens")
+			changed = true
+		} else if hasMT && !mtIsNull {
+			delete(root, "max_completion_tokens")
+			changed = true
 		}
 	}
 
@@ -518,6 +648,9 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 		targetModel := resolveEffectiveEffortModel(envelopeModel, bodyModel)
 		if !isReasoningEffortSupported(targetModel, effort) {
 			delete(root, "reasoning_effort")
+			if _, hasPM := root["prompt_mode"]; hasPM {
+				delete(root, "prompt_mode")
+			}
 			changed = true
 		} else {
 			if normEffort := strings.ToLower(strings.TrimSpace(effort)); normEffort != "" && normEffort != effort {
@@ -567,11 +700,18 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 							}
 						}
 					}
-					if pRaw, hasP := fn["parameters"]; hasP {
-						if normP, pChg := normalizeToolParametersSchema(pRaw); pChg {
-							fn["parameters"] = normP
+					for _, optNull := range []string{"description", "strict"} {
+						if v, exists := fn[optNull]; exists && string(bytes.TrimSpace(v)) == "null" {
+							delete(fn, optNull)
 							toolsChanged = true
 						}
+					}
+					if pRaw, hasP := fn["parameters"]; !hasP || string(bytes.TrimSpace(pRaw)) == "null" {
+						fn["parameters"] = json.RawMessage(`{"type":"object","properties":{}}`)
+						toolsChanged = true
+					} else if normP, pChg := normalizeToolParametersSchema(pRaw); pChg {
+						fn["parameters"] = normP
+						toolsChanged = true
 					}
 					fnBytes, _ := json.Marshal(fn)
 					cleanTool := map[string]json.RawMessage{
@@ -660,6 +800,10 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 	for _, p := range parts {
 		if _, hasCC := p["cache_control"]; hasCC {
 			delete(p, "cache_control")
+			changed = true
+		}
+		if pType := jsonStringValue(p["type"]); pType == "input_text" {
+			p["type"] = json.RawMessage(`"text"`)
 			changed = true
 		}
 	}
@@ -774,6 +918,10 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 
 		switch role {
 		case "system":
+			if _, hasContent := m["content"]; !hasContent || string(bytes.TrimSpace(m["content"])) == "null" {
+				m["content"] = json.RawMessage(`""`)
+				changed = true
+			}
 			for k := range m {
 				if k != "role" && k != "content" {
 					delete(m, k)
@@ -783,6 +931,10 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 			outMsgs = append(outMsgs, m)
 
 		case "user":
+			if _, hasContent := m["content"]; !hasContent || string(bytes.TrimSpace(m["content"])) == "null" {
+				m["content"] = json.RawMessage(`""`)
+				changed = true
+			}
 			for k := range m {
 				if k != "role" && k != "content" {
 					delete(m, k)
@@ -1107,8 +1259,7 @@ func flattenMsgOrDelta(m map[string]json.RawMessage, isWholeMessage bool) bool {
 }
 
 func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
-	if !bytes.Contains(raw, []byte(`"content":[`)) &&
-		!bytes.Contains(raw, []byte(`"content": [`)) &&
+	if !(bytes.Contains(raw, []byte(`"content"`)) && bytes.Contains(raw, []byte(`[`))) &&
 		!bytes.Contains(raw, []byte(`"model_length"`)) {
 		return raw, false
 	}
@@ -1159,8 +1310,7 @@ func TransformMistralResponse(body []byte, stream bool) ([]byte, bool) {
 	if len(body) == 0 {
 		return body, false
 	}
-	if !bytes.Contains(body, []byte(`"content":[`)) &&
-		!bytes.Contains(body, []byte(`"content": [`)) &&
+	if !(bytes.Contains(body, []byte(`"content"`)) && bytes.Contains(body, []byte(`[`))) &&
 		!bytes.Contains(body, []byte(`"model_length"`)) {
 		return body, false
 	}
