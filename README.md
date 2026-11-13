@@ -18,6 +18,19 @@ CLIProxyAPI (CPA) 专用 Mistral **协议格式（Wire-Format）**双向兼容�
 5. **不支持的推理档位自动使用上游默认值**：
    对已知受限模型，仅删除其不支持的 `reasoning_effort`（包含不应直接发往 Mistral 的 `auto`），让上游按模型默认档位推理；受支持的值与未知模型的值原样保留，绝不映射成其他档位。
 
+## 推理档位支持矩阵（已知受限模型）
+| 模型族 | 保留的档位 | 其他值（含 `auto`） |
+|---|---|---|
+| `*deepseek*` | `none`、`low`、`high`、`xhigh`、`max` | 剥离 `reasoning_effort`（使用上游默认） |
+| `*glm-5?2*`（`zai-glm-5-2`、`glm-5-2`、`glm-5.2`） | `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | 剥离 `reasoning_effort`（使用上游默认） |
+| `*glm-5?3*` / `*zai-glm*`（`zai-glm-5-3`、`zai-glm-5-3-flash`、`zai-glm-5`、`zai-glm-latest`） | `low`、`high`、`max` | 剥离 `reasoning_effort`（使用上游默认） |
+| `mistral-large-4*`、`mistral-large-latest` | `low`、`medium`、`high` | 剥离 `reasoning_effort`（使用上游默认） |
+| `mistral-small-2603*`、`mistral-small-4*`、`mistral-small-latest`、`mistral-medium*`、`magistral-*`、`mistral-vibe-*` | `none`、`high` | 剥离 `reasoning_effort`（使用上游默认） |
+| `mistral-large*`（旧版 `2407`/`2411`/`2512`）、`codestral*`、`ministral*`、`mistral-code*` | *（不支持）* | 剥离 `reasoning_effort` |
+| 其他未知模型 | 原样透传 | 原样透传 |
+
+> **关于 CPA `model(effort)` 思考后缀：** CPA 宿主会在插件拦截与翻译之后执行 `ApplyRequestThinkingDoc` 解析 `model(medium)` 后缀；若对受限 Mistral 模型使用括号后缀语法，请在 CPA `config.yaml` 对应模型下同时声明 `thinking.levels`。
+
 ## 部署路径
 - ARM64 容器：`<CPA>/plugins/linux/arm64/cpa-mistral-compat.so`
 - AMD64 容器：`<CPA>/plugins/linux/amd64/cpa-mistral-compat.so`
