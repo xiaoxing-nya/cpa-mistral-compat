@@ -13,8 +13,8 @@ CLIProxyAPI (CPA) 专用 Mistral **协议格式（Wire-Format）**双向兼容�
    - `tool_call_id` 确定性哈希归一化为 9 位字母数字 `[A-Za-z0-9]{9}`；
    - 修正 `assistant.prefix` 约束；
    - 递归将 Gemini 工具参数中的全大写类型（`OBJECT`/`STRING` 等）及 `nullable` 规范化为标准 JSON Schema。
-4. **轻量零拷贝自动模型发现**：
-   启用 `schema_version: 7` 的 `request_interceptor_omit_body_before/after`（不拷贝请求体），仅通过 `host_callback_id` 查询 `host.auth.list` + `host.auth.models` 自动发现绑定在 `mistral` 渠道下的模型与 `alias`。
+4. **基于选中凭证的精准隔离（不与其他渠道打架）**：
+   通过 `host.auth.list` + `host.auth.models` 识别 Mistral 凭证的 `id` / `auth_index`，并在 `request.intercept_after` 校验宿主传入的 `selected_auth_id` / `selected_auth_index`（`before` 阶段保持 `omit_body_before: true` 零拷贝）。非 Mistral 凭证（如 `cline-pass` 等）的请求哪怕模型名或别名完全相同也会零改动直接放行。
 5. **不支持的推理档位自动使用上游默认值**：
    对已知受限模型，仅删除其不支持的 `reasoning_effort`（包含不应直接发往 Mistral 的 `auto`），让上游按模型默认档位推理；受支持的值与未知模型的值原样保留，绝不映射成其他档位。
 

@@ -75,9 +75,11 @@ var (
 	cfgMu     sync.RWMutex
 	activeCfg = DefaultConfig()
 
-	discoveredMu     sync.RWMutex
-	discoveredModels = map[string]bool{}
-	lastDiscovery    time.Time
+	discoveredMu             sync.RWMutex
+	mistralCredIDs           = map[string]bool{}
+	knownCredIDs             = map[string]bool{}
+	crossProtoMistralTargets = map[string]time.Time{}
+	lastDiscovery            time.Time
 )
 
 func main() {}
@@ -252,7 +254,7 @@ func buildRegistration() ([]byte, error) {
 			RequestNormalizer:                true,
 			RequestInterceptor:               true,
 			RequestInterceptorOmitBodyBefore: true,
-			RequestInterceptorOmitBodyAfter:  true,
+			RequestInterceptorOmitBodyAfter:  false,
 			ResponseBeforeTranslator:         true,
 			ResponseInterceptor:              true,
 			StreamChunkInterceptor:           true,
@@ -282,12 +284,18 @@ type payloadResp struct {
 }
 
 type requestInterceptReq struct {
-	Model          string `json:"Model"`
-	RequestedModel string `json:"RequestedModel"`
-	HostCallbackID string `json:"host_callback_id"`
+	SourceFormat   string         `json:"SourceFormat"`
+	ToFormat       string         `json:"ToFormat"`
+	Model          string         `json:"Model"`
+	RequestedModel string         `json:"RequestedModel"`
+	Body           []byte         `json:"Body"`
+	Metadata       map[string]any `json:"Metadata"`
+	HostCallbackID string         `json:"host_callback_id"`
 }
 
-type requestInterceptResp struct{}
+type requestInterceptResp struct {
+	Body []byte `json:"Body,omitempty"`
+}
 
 type responseInterceptReq struct {
 	Body []byte `json:"Body"`
@@ -306,14 +314,63 @@ type streamChunkInterceptResp struct {
 	Body []byte `json:"Body,omitempty"`
 }
 
-func checkTargetAndRemember(model, requestedModel, callbackID string, body []byte, cfg Config) bool {
-	if callbackID != "" {
-		refreshDiscoveredMistralModels(callbackID, cfg)
+func stringFromMetadata(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
 	}
-	// discoveredModels is ONLY populated by refreshDiscoveredMistralModels (host.auth.models).
-	// Pattern-matched models are NOT remembered here — doing so would pollute
-	// discoveredModels with non-Mistral models that share name prefixes.
-	return IsMistralTarget(model, requestedModel, "", body, cfg) || isDiscoveredMistralModel(model, requestedModel)
+	if v, ok := meta[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func crossProtoTargetKey(fromFmt, model string) string {
+	m := strings.ToLower(strings.TrimSpace(stripThinkingSuffix(model)))
+	if fromFmt == "" || m == "" {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(fromFmt)) + "|" + m
+}
+
+func markCrossProtoMistralTarget(fromFmt, model string) {
+	k := crossProtoTargetKey(fromFmt, model)
+	if k == "" {
+		return
+	}
+	now := time.Now()
+	discoveredMu.Lock()
+	for oldKey, ts := range crossProtoMistralTargets {
+		if now.Sub(ts) > 60*time.Second {
+			delete(crossProtoMistralTargets, oldKey)
+		}
+	}
+	crossProtoMistralTargets[k] = now
+	discoveredMu.Unlock()
+}
+
+func clearCrossProtoMistralTarget(fromFmt, model string) {
+	k := crossProtoTargetKey(fromFmt, model)
+	if k == "" {
+		return
+	}
+	discoveredMu.Lock()
+	delete(crossProtoMistralTargets, k)
+	discoveredMu.Unlock()
+}
+
+func isCrossProtoMistralTarget(fromFmt, model string) bool {
+	k := crossProtoTargetKey(fromFmt, model)
+	if k == "" {
+		return false
+	}
+	now := time.Now()
+	discoveredMu.RLock()
+	ts, ok := crossProtoMistralTargets[k]
+	discoveredMu.RUnlock()
+	if !ok {
+		return false
+	}
+	return now.Sub(ts) <= 60*time.Second
 }
 
 func handleMethod(method string, reqBytes []byte) ([]byte, error) {
@@ -329,13 +386,74 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 	case "plugin.quiesce", "plugin.shutdown":
 		return okEnvelope(struct{}{})
 
-	case "request.intercept_before", "request.intercept_after":
-		// Lightweight metadata-only hook (omit_body=true on schema v7+) solely for dynamic credential model discovery.
+	case "request.intercept_before":
+		// Lightweight metadata-only hook (omit_body_before=true) to warm credential discovery.
 		var req requestInterceptReq
 		if json.Unmarshal(reqBytes, &req) == nil {
 			cfg := getConfig()
-			if cfg.Enabled {
-				_ = checkTargetAndRemember(req.Model, req.RequestedModel, req.HostCallbackID, nil, cfg)
+			if cfg.Enabled && req.HostCallbackID != "" {
+				refreshCredentials(req.HostCallbackID, "", "", cfg)
+			}
+		}
+		return okEnvelope(requestInterceptResp{})
+
+	case "request.intercept_after":
+		var req requestInterceptReq
+		if json.Unmarshal(reqBytes, &req) != nil {
+			return okEnvelope(requestInterceptResp{})
+		}
+		cfg := getConfig()
+		if !cfg.Enabled {
+			return okEnvelope(requestInterceptResp{})
+		}
+		toFmt := strings.ToLower(strings.TrimSpace(req.ToFormat))
+		if toFmt != "" && toFmt != "openai" {
+			return okEnvelope(requestInterceptResp{})
+		}
+
+		authID := stringFromMetadata(req.Metadata, "selected_auth_id")
+		authIndex := stringFromMetadata(req.Metadata, "selected_auth_index")
+		if req.HostCallbackID != "" {
+			refreshCredentials(req.HostCallbackID, authID, authIndex, cfg)
+		}
+
+		var isMistral bool
+		if authID != "" || authIndex != "" {
+			isMistral = isMistralCredential(authID, authIndex)
+		} else {
+			// Legacy fallback when host omits selected_auth_* metadata.
+			isMistral = IsMistralTarget(req.Model, req.RequestedModel, "", req.Body, cfg)
+		}
+
+		srcFmt := strings.ToLower(strings.TrimSpace(req.SourceFormat))
+		if !isMistral {
+			if srcFmt != "" && srcFmt != "openai" {
+				clearCrossProtoMistralTarget(srcFmt, req.Model)
+			}
+			return okEnvelope(requestInterceptResp{})
+		}
+
+		if srcFmt == "" || srcFmt == "openai" {
+			if len(req.Body) == 0 {
+				return okEnvelope(requestInterceptResp{})
+			}
+			model := req.Model
+			if model == "" {
+				model = req.RequestedModel
+			}
+			if out, changed := TransformMistralChatRequest(req.Body, model, cfg); changed {
+				return okEnvelope(requestInterceptResp{Body: out})
+			}
+			return okEnvelope(requestInterceptResp{})
+		}
+
+		// Cross-protocol request (claude / openai-response / gemini -> openai):
+		// strip unsupported source thinking here (before ApplyRequestThinkingDoc reads OriginalRequest),
+		// and mark the (SourceFormat, upstreamModel) pair for post-translation normalization in request.normalize.
+		markCrossProtoMistralTarget(srcFmt, req.Model)
+		if len(req.Body) > 0 {
+			if out, changed := StripUnsupportedSourceThinking(req.Body, srcFmt, req.Model, req.RequestedModel); changed {
+				return okEnvelope(requestInterceptResp{Body: out})
 			}
 		}
 		return okEnvelope(requestInterceptResp{})
@@ -353,10 +471,12 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 		if toFmt != "" && toFmt != "openai" {
 			return okEnvelope(payloadResp{})
 		}
-		// Only process models confirmed on Mistral credentials (via host.auth.models).
-		// IsMistralTarget pattern matching is NOT used here: broad patterns match
-		// models on other channels (e.g. glm-5.3 on cline-pass) and corrupt their requests.
-		if !isDiscoveredMistralModel(req.Model, "") {
+		fromFmt := strings.ToLower(strings.TrimSpace(req.FromFormat))
+		// Same-protocol OpenAI requests are already gated by selected_auth_id and normalized in request.intercept_after.
+		if fromFmt == "" || fromFmt == "openai" {
+			return okEnvelope(payloadResp{})
+		}
+		if !isCrossProtoMistralTarget(fromFmt, req.Model) {
 			return okEnvelope(payloadResp{})
 		}
 		if out, changed := TransformMistralChatRequest(req.Body, req.Model, cfg); changed {
@@ -448,30 +568,40 @@ func isMistralProviderKey(provider, baseURL string, cfg Config) bool {
 	return false
 }
 
-func rememberDiscoveredModel(m string) {
-	c := strings.ToLower(strings.TrimSpace(stripThinkingSuffix(m)))
-	if c == "" {
-		return
+func isMistralCredential(authID, authIndex string) bool {
+	discoveredMu.RLock()
+	defer discoveredMu.RUnlock()
+	if authID != "" && mistralCredIDs[authID] {
+		return true
 	}
-	discoveredMu.Lock()
-	discoveredModels[c] = true
-	discoveredMu.Unlock()
+	if authIndex != "" && mistralCredIDs[authIndex] {
+		return true
+	}
+	return false
 }
 
-func refreshDiscoveredMistralModels(callbackID string, cfg Config) {
+func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
 	if callbackID == "" {
 		return
 	}
 	discoveredMu.RLock()
-	if time.Since(lastDiscovery) < 15*time.Second && len(discoveredModels) > 0 {
-		discoveredMu.RUnlock()
-		return
+	fresh := time.Since(lastDiscovery) < 15*time.Second && len(knownCredIDs) > 0
+	if fresh && unseenID1 != "" && !knownCredIDs[unseenID1] {
+		fresh = false
+	}
+	if fresh && unseenID2 != "" && !knownCredIDs[unseenID2] {
+		fresh = false
 	}
 	discoveredMu.RUnlock()
+	if fresh {
+		return
+	}
 
 	reqBody, _ := json.Marshal(map[string]string{"host_callback_id": callbackID})
 
-	mistralAuthIDs := map[string]bool{}
+	nextMistral := map[string]bool{}
+	nextKnown := map[string]bool{}
+
 	if listRaw, ok := callHostAPI("host.auth.list", reqBody); ok {
 		var listResp struct {
 			Files []struct {
@@ -483,12 +613,18 @@ func refreshDiscoveredMistralModels(callbackID string, cfg Config) {
 		}
 		if json.Unmarshal(listRaw, &listResp) == nil {
 			for _, f := range listResp.Files {
+				if f.ID != "" {
+					nextKnown[f.ID] = true
+				}
+				if f.AuthIndex != "" {
+					nextKnown[f.AuthIndex] = true
+				}
 				if isMistralProviderKey(f.Provider, f.BaseURL, cfg) {
 					if f.ID != "" {
-						mistralAuthIDs[f.ID] = true
+						nextMistral[f.ID] = true
 					}
 					if f.AuthIndex != "" {
-						mistralAuthIDs[f.AuthIndex] = true
+						nextMistral[f.AuthIndex] = true
 					}
 				}
 			}
@@ -511,36 +647,28 @@ func refreshDiscoveredMistralModels(callbackID string, cfg Config) {
 		return
 	}
 
-	discoveredMu.Lock()
-	defer discoveredMu.Unlock()
-	lastDiscovery = time.Now()
 	for _, c := range modelsResp.Credentials {
-		if mistralAuthIDs[c.ID] || mistralAuthIDs[c.AuthIndex] || isMistralProviderKey(c.Provider, "", cfg) {
-			for _, m := range c.Models {
-				if trimmed := strings.ToLower(strings.TrimSpace(m)); trimmed != "" {
-					discoveredModels[trimmed] = true
-				}
+		if c.ID != "" {
+			nextKnown[c.ID] = true
+		}
+		if c.AuthIndex != "" {
+			nextKnown[c.AuthIndex] = true
+		}
+		if nextMistral[c.ID] || nextMistral[c.AuthIndex] || isMistralProviderKey(c.Provider, "", cfg) {
+			if c.ID != "" {
+				nextMistral[c.ID] = true
+			}
+			if c.AuthIndex != "" {
+				nextMistral[c.AuthIndex] = true
 			}
 		}
 	}
-}
 
-func isDiscoveredMistralModel(model, requestedModel string) bool {
-	discoveredMu.RLock()
-	defer discoveredMu.RUnlock()
-	for _, cand := range []string{stripThinkingSuffix(model), stripThinkingSuffix(requestedModel)} {
-		c := strings.ToLower(strings.TrimSpace(cand))
-		if c == "" {
-			continue
-		}
-		if discoveredModels[c] {
-			return true
-		}
-		if slash := strings.IndexByte(c, '/'); slash >= 0 && discoveredModels[c[slash+1:]] {
-			return true
-		}
-	}
-	return false
+	discoveredMu.Lock()
+	mistralCredIDs = nextMistral
+	knownCredIDs = nextKnown
+	lastDiscovery = time.Now()
+	discoveredMu.Unlock()
 }
 
 func okEnvelope(v any) ([]byte, error) {

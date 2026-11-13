@@ -224,6 +224,241 @@ func isReasoningEffortSupported(model, effort string) bool {
 	return false
 }
 
+func resolveEffectiveEffortModel(primary, fallback string) string {
+	if _, matched := resolveReasoningEffortSupport(primary); matched {
+		return primary
+	}
+	if _, matched := resolveReasoningEffortSupport(fallback); matched {
+		return fallback
+	}
+	if primary != "" {
+		return primary
+	}
+	return fallback
+}
+
+func convertBudgetToLevel(budget int) (string, bool) {
+	switch {
+	case budget < -1:
+		return "", false
+	case budget == -1:
+		return "auto", true
+	case budget == 0:
+		return "none", true
+	case budget <= 512:
+		return "minimal", true
+	case budget <= 1024:
+		return "low", true
+	case budget <= 8192:
+		return "medium", true
+	case budget <= 24576:
+		return "high", true
+	default:
+		return "xhigh", true
+	}
+}
+
+func jsonStringValue(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.ToLower(strings.TrimSpace(s))
+	}
+	return ""
+}
+
+func jsonIntValue(raw json.RawMessage) (int, bool) {
+	var i int
+	if json.Unmarshal(raw, &i) == nil {
+		return i, true
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) == nil {
+		return int(f), true
+	}
+	return 0, false
+}
+
+// StripUnsupportedSourceThinking strips known-unsupported reasoning effort settings
+// from the source request payload before CPA translates and applies thinking config.
+// Supported efforts and unknown models remain untouched.
+func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedModel string) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	targetModel := resolveEffectiveEffortModel(model, requestedModel)
+	if _, restricted := resolveReasoningEffortSupport(targetModel); !restricted {
+		return body, false
+	}
+
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
+		return body, false
+	}
+	if targetModel == "" {
+		var bodyModel string
+		_ = json.Unmarshal(root["model"], &bodyModel)
+		targetModel = bodyModel
+		if _, restricted := resolveReasoningEffortSupport(targetModel); !restricted {
+			return body, false
+		}
+	}
+
+	changed := false
+	switch strings.ToLower(strings.TrimSpace(sourceFormat)) {
+	case "", "openai":
+		if reRaw, hasRE := root["reasoning_effort"]; hasRE && string(bytes.TrimSpace(reRaw)) != "null" {
+			var effort string
+			_ = json.Unmarshal(reRaw, &effort)
+			if !isReasoningEffortSupported(targetModel, effort) {
+				delete(root, "reasoning_effort")
+				changed = true
+			}
+		}
+
+	case "openai-response":
+		if rRaw, hasR := root["reasoning"]; hasR && string(bytes.TrimSpace(rRaw)) != "null" {
+			var rMap map[string]json.RawMessage
+			if json.Unmarshal(rRaw, &rMap) == nil && rMap != nil {
+				if effort := jsonStringValue(rMap["effort"]); effort != "" && !isReasoningEffortSupported(targetModel, effort) {
+					delete(rMap, "effort")
+					if len(rMap) == 0 {
+						delete(root, "reasoning")
+					} else {
+						root["reasoning"], _ = json.Marshal(rMap)
+					}
+					changed = true
+				}
+			}
+		}
+		if reRaw, hasRE := root["reasoning_effort"]; hasRE && string(bytes.TrimSpace(reRaw)) != "null" {
+			if effort := jsonStringValue(reRaw); effort != "" && !isReasoningEffortSupported(targetModel, effort) {
+				delete(root, "reasoning_effort")
+				changed = true
+			}
+		}
+
+	case "claude":
+		var outCfg map[string]json.RawMessage
+		if ocRaw, hasOC := root["output_config"]; hasOC {
+			_ = json.Unmarshal(ocRaw, &outCfg)
+		}
+		outputEffort := ""
+		if outCfg != nil {
+			outputEffort = jsonStringValue(outCfg["effort"])
+		}
+
+		var thMap map[string]json.RawMessage
+		hasThinking := false
+		if thRaw, ok := root["thinking"]; ok && string(bytes.TrimSpace(thRaw)) != "null" {
+			if json.Unmarshal(thRaw, &thMap) == nil && thMap != nil {
+				hasThinking = true
+			}
+		}
+
+		effectiveEffort := ""
+		if hasThinking {
+			switch jsonStringValue(thMap["type"]) {
+			case "disabled":
+				effectiveEffort = "none"
+			case "adaptive", "auto":
+				if outputEffort != "" {
+					effectiveEffort = outputEffort
+				} else {
+					effectiveEffort = "xhigh"
+				}
+			case "enabled":
+				if btRaw, hasBT := thMap["budget_tokens"]; hasBT && string(bytes.TrimSpace(btRaw)) != "null" {
+					if b, ok := jsonIntValue(btRaw); ok {
+						if lvl, okLvl := convertBudgetToLevel(b); okLvl {
+							effectiveEffort = lvl
+						}
+					}
+				} else if outputEffort != "" {
+					effectiveEffort = outputEffort
+				} else {
+					effectiveEffort = "auto"
+				}
+			}
+		} else if outputEffort != "" {
+			effectiveEffort = outputEffort
+		}
+
+		if effectiveEffort != "" && !isReasoningEffortSupported(targetModel, effectiveEffort) {
+			if hasThinking {
+				delete(root, "thinking")
+				changed = true
+			}
+			if outCfg != nil {
+				if _, hasEff := outCfg["effort"]; hasEff {
+					delete(outCfg, "effort")
+					if len(outCfg) == 0 {
+						delete(root, "output_config")
+					} else {
+						root["output_config"], _ = json.Marshal(outCfg)
+					}
+					changed = true
+				}
+			}
+		}
+
+	case "gemini":
+		if gcRaw, hasGC := root["generationConfig"]; hasGC && string(bytes.TrimSpace(gcRaw)) != "null" {
+			var gc map[string]json.RawMessage
+			if json.Unmarshal(gcRaw, &gc) == nil && gc != nil {
+				if tcRaw, hasTC := gc["thinkingConfig"]; hasTC && string(bytes.TrimSpace(tcRaw)) != "null" {
+					var tc map[string]json.RawMessage
+					if json.Unmarshal(tcRaw, &tc) == nil && tc != nil {
+						effectiveEffort := ""
+						for _, lk := range []string{"thinkingLevel", "thinking_level"} {
+							if v := jsonStringValue(tc[lk]); v != "" {
+								effectiveEffort = v
+								break
+							}
+						}
+						if effectiveEffort == "" {
+							for _, bk := range []string{"thinkingBudget", "thinking_budget"} {
+								if bRaw, ok := tc[bk]; ok && string(bytes.TrimSpace(bRaw)) != "null" {
+									if b, okInt := jsonIntValue(bRaw); okInt {
+										if lvl, okLvl := convertBudgetToLevel(b); okLvl {
+											effectiveEffort = lvl
+										}
+									}
+									break
+								}
+							}
+						}
+						if effectiveEffort != "" && !isReasoningEffortSupported(targetModel, effectiveEffort) {
+							for _, k := range []string{"thinkingLevel", "thinking_level", "thinkingBudget", "thinking_budget"} {
+								if _, exists := tc[k]; exists {
+									delete(tc, k)
+									changed = true
+								}
+							}
+							if changed {
+								if len(tc) == 0 {
+									delete(gc, "thinkingConfig")
+								} else {
+									gc["thinkingConfig"], _ = json.Marshal(tc)
+								}
+								root["generationConfig"], _ = json.Marshal(gc)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // TransformMistralChatRequest performs pure wire-format normalization from OpenAI Chat Completions to Mistral Chat Completions.
 // It preserves supported reasoning_effort values and omits known-unsupported ones so the upstream model uses its default.
 func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) ([]byte, bool) {
@@ -274,16 +509,11 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 
 	// 4. Drop only known-unsupported efforts (upstream default); otherwise preserve protocol mutual exclusion.
 	if reRaw, hasRE := root["reasoning_effort"]; hasRE && string(bytes.TrimSpace(reRaw)) != "null" {
-		var model, effort string
-		_ = json.Unmarshal(root["model"], &model)
+		var bodyModel, effort string
+		_ = json.Unmarshal(root["model"], &bodyModel)
 		_ = json.Unmarshal(reRaw, &effort)
-		// Body model takes priority; fall back to envelope model (upstream ID) for custom aliases.
-		if _, matched := resolveReasoningEffortSupport(model); !matched && envelopeModel != "" && envelopeModel != model {
-			if _, envMatched := resolveReasoningEffortSupport(envelopeModel); envMatched {
-				model = envelopeModel
-			}
-		}
-		if !isReasoningEffortSupported(model, effort) {
+		targetModel := resolveEffectiveEffortModel(envelopeModel, bodyModel)
+		if !isReasoningEffortSupported(targetModel, effort) {
 			delete(root, "reasoning_effort")
 			changed = true
 		} else if _, hasPM := root["prompt_mode"]; hasPM {
@@ -812,6 +1042,9 @@ func extractTypedContentParts(raw json.RawMessage) (text string, think string, i
 					kb.WriteString(in.Text)
 				}
 			}
+		default:
+			// Preserve multimodal/unknown blocks (e.g. image_url, audio, refusal) untouched.
+			return "", "", false
 		}
 	}
 	return tb.String(), kb.String(), true

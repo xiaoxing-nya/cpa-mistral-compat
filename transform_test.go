@@ -254,3 +254,152 @@ func TestTransformMistralResponse_StreamAndNonStream(t *testing.T) {
 		t.Fatalf("unexpected SSE output: %s", outSSE)
 	}
 }
+
+func TestTransformMistralChatRequest_EnvelopeModelOverridesConflictingAlias(t *testing.T) {
+	// Client aliases GLM 5.2 (supports none/high/max, NOT low) as "glm-5.3" (which allows low).
+	// Upstream envelope model MUST take priority over client alias.
+	raw := []byte(`{"model":"glm-5.3","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
+	out, changed := TransformMistralChatRequest(raw, "zai-glm-5-2", DefaultConfig())
+	if !changed {
+		t.Fatal("expected request to be changed")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, hasRE := got["reasoning_effort"]; hasRE {
+		t.Fatalf("expected low reasoning_effort to be stripped for zai-glm-5-2, got %s", out)
+	}
+}
+
+func TestStripUnsupportedSourceThinking(t *testing.T) {
+	tests := []struct {
+		name           string
+		sourceFormat   string
+		model          string
+		requestedModel string
+		body           string
+		wantChanged    bool
+		check          func(t *testing.T, got map[string]any)
+	}{
+		{
+			name:         "responses unsupported medium stripped",
+			sourceFormat: "openai-response",
+			model:        "zai-glm-5-3",
+			body:         `{"model":"glm-5.3","reasoning":{"effort":"medium","summary":"auto"},"input":"hi"}`,
+			wantChanged:  true,
+			check: func(t *testing.T, got map[string]any) {
+				r, _ := got["reasoning"].(map[string]any)
+				if _, hasEffort := r["effort"]; hasEffort {
+					t.Fatalf("expected reasoning.effort to be stripped: %#v", got)
+				}
+				if r["summary"] != "auto" {
+					t.Fatalf("expected reasoning.summary preserved: %#v", r)
+				}
+			},
+		},
+		{
+			name:         "responses supported high preserved",
+			sourceFormat: "openai-response",
+			model:        "zai-glm-5-3",
+			body:         `{"model":"glm-5.3","reasoning":{"effort":"high"},"input":"hi"}`,
+			wantChanged:  false,
+			check: func(t *testing.T, got map[string]any) {
+				r, _ := got["reasoning"].(map[string]any)
+				if r["effort"] != "high" {
+					t.Fatalf("expected reasoning.effort=high preserved: %#v", got)
+				}
+			},
+		},
+		{
+			name:         "claude budget 8192 maps to unsupported medium and is stripped on glm-5.3",
+			sourceFormat: "claude",
+			model:        "zai-glm-5-3",
+			body:         `{"model":"glm-5.3","thinking":{"type":"enabled","budget_tokens":8192},"messages":[]}`,
+			wantChanged:  true,
+			check: func(t *testing.T, got map[string]any) {
+				if _, has := got["thinking"]; has {
+					t.Fatalf("expected thinking stripped: %#v", got)
+				}
+			},
+		},
+		{
+			name:         "claude disabled maps to none which is unsupported on glm-5.3",
+			sourceFormat: "claude",
+			model:        "zai-glm-5-3",
+			body:         `{"model":"glm-5.3","thinking":{"type":"disabled"},"messages":[]}`,
+			wantChanged:  true,
+			check: func(t *testing.T, got map[string]any) {
+				if _, has := got["thinking"]; has {
+					t.Fatalf("expected thinking stripped: %#v", got)
+				}
+			},
+		},
+		{
+			name:         "claude disabled is preserved on glm-5.2",
+			sourceFormat: "claude",
+			model:        "zai-glm-5-2",
+			body:         `{"model":"glm-5.2","thinking":{"type":"disabled"},"messages":[]}`,
+			wantChanged:  false,
+			check: func(t *testing.T, got map[string]any) {
+				th, _ := got["thinking"].(map[string]any)
+				if th["type"] != "disabled" {
+					t.Fatalf("expected thinking.type=disabled preserved: %#v", got)
+				}
+			},
+		},
+		{
+			name:         "gemini unsupported medium thinkingLevel stripped on glm-5.3",
+			sourceFormat: "gemini",
+			model:        "zai-glm-5-3",
+			body:         `{"generationConfig":{"thinkingConfig":{"thinkingLevel":"medium","includeThoughts":true}},"contents":[]}`,
+			wantChanged:  true,
+			check: func(t *testing.T, got map[string]any) {
+				gc, _ := got["generationConfig"].(map[string]any)
+				tc, _ := gc["thinkingConfig"].(map[string]any)
+				if _, has := tc["thinkingLevel"]; has {
+					t.Fatalf("expected thinkingLevel stripped: %#v", got)
+				}
+				if tc["includeThoughts"] != true {
+					t.Fatalf("expected includeThoughts preserved: %#v", tc)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, changed := StripUnsupportedSourceThinking([]byte(tt.body), tt.sourceFormat, tt.model, tt.requestedModel)
+			if changed != tt.wantChanged {
+				t.Fatalf("changed = %v, want %v; out=%s", changed, tt.wantChanged, out)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			tt.check(t, got)
+		})
+	}
+}
+
+func TestTransformMistralResponse_PreservesUnknownMultimodalParts(t *testing.T) {
+	nonMistral := []byte(`{
+		"id": "cmpl-2",
+		"object": "chat.completion",
+		"choices": [{
+			"index": 0,
+			"finish_reason": "stop",
+			"message": {
+				"role": "assistant",
+				"content": [
+					{"type": "text", "text": "Here is the image:"},
+					{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+				]
+			}
+		}]
+	}`)
+	out, changed := TransformMistralResponse(nonMistral, false)
+	if changed {
+		t.Fatalf("expected non-Mistral multimodal response to stay untouched, got: %s", out)
+	}
+}
