@@ -187,3 +187,64 @@ func TestRequestInterceptAfter_CredentialIsolationAndAliasNormalization(t *testi
 		t.Fatalf("expected non-Mistral cross-protocol request untouched, got: %s", normClineResp.Body)
 	}
 }
+
+func TestRefreshCredentials_HotReloadsUnseenAuthID(t *testing.T) {
+	resetPluginStateForTest()
+	origCaller := hostAPICaller
+	defer func() { hostAPICaller = origCaller }()
+
+	callCount := 0
+	hostAPICaller = func(method string, payload []byte) ([]byte, bool) {
+		callCount++
+		switch method {
+		case "host.auth.list":
+			return []byte(`{"files":[]}`), true
+		case "host.auth.models":
+			if callCount <= 2 {
+				return []byte(`{"credentials":[{"id":"openai-compatibility:cline-pass:bbb","auth_index":"idx-cline","provider":"openai-compatible-cline-pass","models":["glm-5.3"]}]}`), true
+			}
+			// Hot-added Mistral credential appears on second refresh.
+			return []byte(`{"credentials":[
+				{"id":"openai-compatibility:cline-pass:bbb","auth_index":"idx-cline","provider":"openai-compatible-cline-pass","models":["glm-5.3"]},
+				{"id":"openai-compatibility:mistral:new","auth_index":"idx-new","provider":"openai-compatible-mistral","models":["my-alias"]}
+			]}`), true
+		}
+		return nil, false
+	}
+
+	// First request warms discovery (only cline-pass known).
+	_ = callPluginMethodForTest(t, "request.intercept_before", map[string]any{
+		"host_callback_id": "cb-1",
+	})
+
+	// Second request within 15s targets a brand-new unseen Mistral auth_id -> MUST force refresh and normalize!
+	env := callPluginMethodForTest(t, "request.intercept_after", map[string]any{
+		"SourceFormat":   "openai",
+		"ToFormat":       "openai",
+		"Model":          "zai-glm-5-3",
+		"RequestedModel": "my-alias",
+		"Body":           []byte(`{"model":"my-alias","store":true,"reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]}`),
+		"Metadata": map[string]any{
+			"selected_auth_id":    "openai-compatibility:mistral:new",
+			"selected_auth_index": "idx-new",
+		},
+		"host_callback_id": "cb-2",
+	})
+	var resp requestInterceptResp
+	if err := json.Unmarshal(env.Result, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Body) == 0 {
+		t.Fatalf("expected hot-added Mistral credential to be recognized immediately and normalized")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(resp.Body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasStore := got["store"]; hasStore {
+		t.Fatalf("store should be stripped: %s", resp.Body)
+	}
+	if _, hasRE := got["reasoning_effort"]; hasRE {
+		t.Fatalf("medium effort should be stripped for zai-glm-5-3: %s", resp.Body)
+	}
+}

@@ -80,6 +80,8 @@ var (
 	knownCredIDs             = map[string]bool{}
 	crossProtoMistralTargets = map[string]time.Time{}
 	lastDiscovery            time.Time
+
+	hostAPICaller = callHostAPI
 )
 
 func main() {}
@@ -174,34 +176,10 @@ func updateConfigFromYAML(raw []byte) {
 			Plugins struct {
 				Configs map[string]pluginConfigYAML `yaml:"configs"`
 			} `yaml:"plugins"`
-			OpenAICompat []struct {
-				Name    string `yaml:"name"`
-				BaseURL string `yaml:"base-url"`
-				Models  []struct {
-					Name  string `yaml:"name"`
-					Alias string `yaml:"alias"`
-				} `yaml:"models"`
-			} `yaml:"openai-compatibility"`
 		}
 		if yaml.Unmarshal(raw, &root) == nil {
 			if pc, ok := root.Plugins.Configs[pluginName]; ok {
 				applyPluginConfigStruct(&cfg, pc)
-			}
-			for _, oc := range root.OpenAICompat {
-				if strings.Contains(strings.ToLower(oc.BaseURL), "mistral.ai") ||
-					strings.Contains(strings.ToLower(oc.Name), "mistral") {
-					if oc.Name != "" {
-						cfg.Providers = append(cfg.Providers, oc.Name, "openai-compatible-"+oc.Name)
-					}
-					for _, m := range oc.Models {
-						if m.Name != "" {
-							cfg.Models = append(cfg.Models, m.Name)
-						}
-						if m.Alias != "" {
-							cfg.Models = append(cfg.Models, m.Alias)
-						}
-					}
-				}
 			}
 		}
 	}
@@ -228,13 +206,13 @@ func buildRegistration() ([]byte, error) {
 					Name:        "models",
 					Type:        "array",
 					Default:     defCfg.Models,
-					Description: "Model patterns (supports * wildcard) routed to Mistral API.",
+					Description: "Fallback model patterns used only when host omits selected_auth_id metadata.",
 				},
 				{
 					Name:        "providers",
 					Type:        "array",
 					Default:     defCfg.Providers,
-					Description: "Provider names in openai-compatibility routed to Mistral API.",
+					Description: "Extra openai-compatibility provider names routed to Mistral API (names containing mistral match automatically).",
 				},
 				{
 					Name:        "normalize_tool_call_ids",
@@ -602,7 +580,7 @@ func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
 	nextMistral := map[string]bool{}
 	nextKnown := map[string]bool{}
 
-	if listRaw, ok := callHostAPI("host.auth.list", reqBody); ok {
+	if listRaw, ok := hostAPICaller("host.auth.list", reqBody); ok {
 		var listResp struct {
 			Files []struct {
 				ID        string `json:"id"`
@@ -631,7 +609,7 @@ func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
 		}
 	}
 
-	modelsRaw, ok := callHostAPI("host.auth.models", reqBody)
+	modelsRaw, ok := hostAPICaller("host.auth.models", reqBody)
 	if !ok {
 		return
 	}

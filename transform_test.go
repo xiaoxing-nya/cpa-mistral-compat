@@ -403,3 +403,66 @@ func TestTransformMistralResponse_PreservesUnknownMultimodalParts(t *testing.T) 
 		t.Fatalf("expected non-Mistral multimodal response to stay untouched, got: %s", out)
 	}
 }
+
+func TestStripUnsupportedSourceThinking_FallsBackToBodyModelWhenArgsEmpty(t *testing.T) {
+	body := []byte(`{"model":"zai-glm-5-3","reasoning":{"effort":"medium"},"input":"hi"}`)
+	out, changed := StripUnsupportedSourceThinking(body, "openai-response", "", "")
+	if !changed {
+		t.Fatalf("expected effort stripped using body.model fallback, got unchanged: %s", out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasR := got["reasoning"]; hasR {
+		t.Fatalf("expected reasoning stripped, got: %s", out)
+	}
+}
+
+func TestTransformMistralChatRequest_CaseInsensitiveSupportedReasoningEffort(t *testing.T) {
+	raw := []byte(`{"model":"zai-glm-5-3","reasoning_effort":" High ","messages":[{"role":"user","content":"hi"}]}`)
+	out, changed := TransformMistralChatRequest(raw, "zai-glm-5-3", DefaultConfig())
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["reasoning_effort"] != "high" {
+		t.Fatalf("expected normalized supported effort 'high', got %v (changed=%v, out=%s)", got["reasoning_effort"], changed, out)
+	}
+}
+
+func TestTransformMistralChatRequest_DoesNotDuplicateExistingThinkingBlockInContentArray(t *testing.T) {
+	raw := []byte(`{
+		"model": "zai-glm-5-3",
+		"messages": [
+			{
+				"role": "assistant",
+				"reasoning_content": "Step 1.",
+				"content": [
+					{"type": "thinking", "closed": true, "thinking": [{"type": "text", "text": "Step 1."}]},
+					{"type": "text", "text": "Answer"}
+				]
+			},
+			{"role": "user", "content": "Next?"}
+		]
+	}`)
+	out, changed := TransformMistralChatRequest(raw, "zai-glm-5-3", DefaultConfig())
+	if !changed {
+		t.Fatal("expected request to change (reasoning_content removed)")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	msg0 := got["messages"].([]any)[0].(map[string]any)
+	parts := msg0["content"].([]any)
+	thinkingCount := 0
+	for _, p := range parts {
+		if pm, ok := p.(map[string]any); ok && pm["type"] == "thinking" {
+			thinkingCount++
+		}
+	}
+	if thinkingCount != 1 {
+		t.Fatalf("expected exactly 1 thinking block, got %d: %s", thinkingCount, out)
+	}
+}

@@ -216,8 +216,9 @@ func isReasoningEffortSupported(model, effort string) bool {
 	if !matched {
 		return true
 	}
+	norm := strings.ToLower(strings.TrimSpace(effort))
 	for _, level := range levels {
-		if effort == level {
+		if norm == level {
 			return true
 		}
 	}
@@ -286,8 +287,10 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 		return body, false
 	}
 	targetModel := resolveEffectiveEffortModel(model, requestedModel)
-	if _, restricted := resolveReasoningEffortSupport(targetModel); !restricted {
-		return body, false
+	if targetModel != "" {
+		if _, restricted := resolveReasoningEffortSupport(targetModel); !restricted {
+			return body, false
+		}
 	}
 
 	var root map[string]json.RawMessage
@@ -516,9 +519,17 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 		if !isReasoningEffortSupported(targetModel, effort) {
 			delete(root, "reasoning_effort")
 			changed = true
-		} else if _, hasPM := root["prompt_mode"]; hasPM {
-			delete(root, "prompt_mode")
-			changed = true
+		} else {
+			if normEffort := strings.ToLower(strings.TrimSpace(effort)); normEffort != "" && normEffort != effort {
+				if _, restricted := resolveReasoningEffortSupport(targetModel); restricted {
+					root["reasoning_effort"], _ = json.Marshal(normEffort)
+					changed = true
+				}
+			}
+			if _, hasPM := root["prompt_mode"]; hasPM {
+				delete(root, "prompt_mode")
+				changed = true
+			}
 		}
 	}
 
@@ -662,6 +673,18 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 	return out, true
 }
 
+func contentPartsHaveThinkingBlock(parts []json.RawMessage) bool {
+	for _, p := range parts {
+		var meta struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(p, &meta) == nil && strings.EqualFold(strings.TrimSpace(meta.Type), "thinking") {
+			return true
+		}
+	}
+	return false
+}
+
 func isEmptyAssistantContent(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || string(trimmed) == "null" || string(trimmed) == `""` || string(trimmed) == "[]" {
@@ -782,24 +805,36 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 				}
 				changed = true
 				if cfg.ConvertThinkingHistory && strings.TrimSpace(think) != "" {
-					thinkChunk, _ := json.Marshal(map[string]any{
-						"type":   "thinking",
-						"closed": true,
-						"thinking": []map[string]string{
-							{"type": "text", "text": think},
-						},
-					})
-					parts := []json.RawMessage{thinkChunk}
 					cTrim := bytes.TrimSpace(m["content"])
 					var existingList []json.RawMessage
 					var existingStr string
 					if len(cTrim) > 0 && cTrim[0] == '[' && json.Unmarshal(cTrim, &existingList) == nil {
-						parts = append(parts, existingList...)
-					} else if json.Unmarshal(cTrim, &existingStr) == nil && existingStr != "" {
-						textChunk, _ := json.Marshal(map[string]string{"type": "text", "text": existingStr})
-						parts = append(parts, textChunk)
+						if !contentPartsHaveThinkingBlock(existingList) {
+							thinkChunk, _ := json.Marshal(map[string]any{
+								"type":   "thinking",
+								"closed": true,
+								"thinking": []map[string]string{
+									{"type": "text", "text": think},
+								},
+							})
+							parts := append([]json.RawMessage{thinkChunk}, existingList...)
+							m["content"], _ = json.Marshal(parts)
+						}
+					} else {
+						thinkChunk, _ := json.Marshal(map[string]any{
+							"type":   "thinking",
+							"closed": true,
+							"thinking": []map[string]string{
+								{"type": "text", "text": think},
+							},
+						})
+						parts := []json.RawMessage{thinkChunk}
+						if json.Unmarshal(cTrim, &existingStr) == nil && existingStr != "" {
+							textChunk, _ := json.Marshal(map[string]string{"type": "text", "text": existingStr})
+							parts = append(parts, textChunk)
+						}
+						m["content"], _ = json.Marshal(parts)
 					}
-					m["content"], _ = json.Marshal(parts)
 				}
 			}
 
