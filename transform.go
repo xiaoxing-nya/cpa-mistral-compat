@@ -174,6 +174,14 @@ var forbiddenTopLevelFields = []string{
 	"text",
 }
 
+var forbiddenTopLevelFieldSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(forbiddenTopLevelFields))
+	for _, f := range forbiddenTopLevelFields {
+		m[f] = struct{}{}
+	}
+	return m
+}()
+
 var messageReasoningFields = []string{"reasoning_content", "reasoning", "reasoning_text", "reasoning_details"}
 
 // restrictedReasoningEffortLevels lists only models with explicitly constrained wire-level values.
@@ -273,6 +281,16 @@ func convertBudgetToLevel(budget int) (string, bool) {
 	}
 }
 
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 func jsonStringValue(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -351,7 +369,7 @@ func stripGeminiThinkingInContainer(container map[string]json.RawMessage, target
 					if len(tc) == 0 {
 						delete(gc, tcKey)
 					} else {
-						gc[tcKey], _ = json.Marshal(tc)
+						gc[tcKey], _ = marshalNoEscape(tc)
 					}
 					gcChanged = true
 				}
@@ -374,7 +392,7 @@ func stripGeminiThinkingInContainer(container map[string]json.RawMessage, target
 			}
 		}
 		if gcChanged {
-			container[gcKey], _ = json.Marshal(gc)
+			container[gcKey], _ = marshalNoEscape(gc)
 			changed = true
 		}
 	}
@@ -426,7 +444,7 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 					if len(rMap) == 0 {
 						delete(root, "reasoning")
 					} else {
-						root["reasoning"], _ = json.Marshal(rMap)
+						root["reasoning"], _ = marshalNoEscape(rMap)
 					}
 					changed = true
 				}
@@ -496,7 +514,7 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 					if len(outCfg) == 0 {
 						delete(root, "output_config")
 					} else {
-						root["output_config"], _ = json.Marshal(outCfg)
+						root["output_config"], _ = marshalNoEscape(outCfg)
 					}
 					changed = true
 				}
@@ -506,7 +524,7 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 			if len(outCfg) == 0 {
 				delete(root, "output_config")
 			} else {
-				root["output_config"], _ = json.Marshal(outCfg)
+				root["output_config"], _ = marshalNoEscape(outCfg)
 			}
 			changed = true
 		}
@@ -519,7 +537,7 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 			var reqObj map[string]json.RawMessage
 			if json.Unmarshal(reqRaw, &reqObj) == nil && reqObj != nil {
 				if stripGeminiThinkingInContainer(reqObj, targetModel) {
-					root["request"], _ = json.Marshal(reqObj)
+					root["request"], _ = marshalNoEscape(reqObj)
 					changed = true
 				}
 			}
@@ -529,7 +547,7 @@ func StripUnsupportedSourceThinking(body []byte, sourceFormat, model, requestedM
 	if !changed {
 		return body, false
 	}
-	out, err := json.Marshal(root)
+	out, err := marshalNoEscape(root)
 	if err != nil {
 		return body, false
 	}
@@ -556,8 +574,8 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 	}
 
 	// 2. Strip forbidden top-level fields (422 extra_forbidden on Mistral)
-	for _, field := range forbiddenTopLevelFields {
-		if _, ok := root[field]; ok {
+	for field := range root {
+		if _, forbidden := forbiddenTopLevelFieldSet[field]; forbidden {
 			delete(root, field)
 			changed = true
 		}
@@ -582,7 +600,7 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 					delete(root, "stream_options")
 					changed = true
 				} else if soChanged {
-					root["stream_options"], _ = json.Marshal(so)
+					root["stream_options"], _ = marshalNoEscape(so)
 					changed = true
 				}
 			}
@@ -614,8 +632,8 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 						}
 					}
 					if jsChanged {
-						rf["json_schema"], _ = json.Marshal(js)
-						root["response_format"], _ = json.Marshal(rf)
+						rf["json_schema"], _ = marshalNoEscape(js)
+						root["response_format"], _ = marshalNoEscape(rf)
 						changed = true
 					}
 				}
@@ -667,11 +685,12 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 	}
 
 	// 4. Drop only known-unsupported efforts (upstream default); otherwise preserve protocol mutual exclusion.
+	var bodyModel string
+	_ = json.Unmarshal(root["model"], &bodyModel)
+	targetModel := resolveEffectiveEffortModel(envelopeModel, bodyModel)
 	if reRaw, hasRE := root["reasoning_effort"]; hasRE && string(bytes.TrimSpace(reRaw)) != "null" {
-		var bodyModel, effort string
-		_ = json.Unmarshal(root["model"], &bodyModel)
+		var effort string
 		_ = json.Unmarshal(reRaw, &effort)
-		targetModel := resolveEffectiveEffortModel(envelopeModel, bodyModel)
 		if !isReasoningEffortSupported(targetModel, effort) {
 			delete(root, "reasoning_effort")
 			if _, hasPM := root["prompt_mode"]; hasPM {
@@ -681,7 +700,7 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 		} else {
 			if normEffort := strings.ToLower(strings.TrimSpace(effort)); normEffort != "" && normEffort != effort {
 				if _, restricted := resolveReasoningEffortSupport(targetModel); restricted {
-					root["reasoning_effort"], _ = json.Marshal(normEffort)
+					root["reasoning_effort"], _ = marshalNoEscape(normEffort)
 					changed = true
 				}
 			}
@@ -689,6 +708,11 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 				delete(root, "prompt_mode")
 				changed = true
 			}
+		}
+	} else if _, hasPM := root["prompt_mode"]; hasPM {
+		if levels, restricted := resolveReasoningEffortSupport(targetModel); restricted && len(levels) == 0 {
+			delete(root, "prompt_mode")
+			changed = true
 		}
 	}
 
@@ -739,7 +763,7 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 						fn["parameters"] = normP
 						toolsChanged = true
 					}
-					fnBytes, _ := json.Marshal(fn)
+					fnBytes, _ := marshalNoEscape(fn)
 					cleanTool := map[string]json.RawMessage{
 						"type":     json.RawMessage(`"function"`),
 						"function": fnBytes,
@@ -752,12 +776,12 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 					kept = append(kept, t)
 				}
 			}
-			if toolsChanged {
+			if toolsChanged || len(kept) == 0 {
 				if len(kept) == 0 {
 					delete(root, "tools")
 					delete(root, "tool_choice")
 				} else {
-					root["tools"], _ = json.Marshal(kept)
+					root["tools"], _ = marshalNoEscape(kept)
 				}
 				changed = true
 			}
@@ -769,7 +793,7 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 	if err := json.Unmarshal(root["messages"], &rawMsgs); err == nil && len(rawMsgs) > 0 {
 		msgsChanged, newMsgs := transformMessages(rawMsgs, cfg)
 		if msgsChanged {
-			root["messages"], _ = json.Marshal(newMsgs)
+			root["messages"], _ = marshalNoEscape(newMsgs)
 			changed = true
 		}
 	}
@@ -777,7 +801,7 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 	if !changed {
 		return body, false
 	}
-	out, err := json.Marshal(root)
+	out, err := marshalNoEscape(root)
 	if err != nil {
 		return body, false
 	}
@@ -904,7 +928,7 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 			changed = true
 		}
 		switch jsonStringValue(p["type"]) {
-		case "input_text":
+		case "input_text", "output_text":
 			p["type"] = json.RawMessage(`"text"`)
 			changed = true
 		case "file":
@@ -933,12 +957,12 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 				docURL = normalizeFilePartDataURL(docURL, fileObj.Filename)
 				if isImageFilePart(docURL, fileObj.Filename) {
 					p["type"] = json.RawMessage(`"image_url"`)
-					p["image_url"], _ = json.Marshal(map[string]string{"url": docURL})
+					p["image_url"], _ = marshalNoEscape(map[string]string{"url": docURL})
 				} else {
 					p["type"] = json.RawMessage(`"document_url"`)
-					p["document_url"], _ = json.Marshal(docURL)
+					p["document_url"], _ = marshalNoEscape(docURL)
 					if name := strings.TrimSpace(fileObj.Filename); name != "" {
-						p["document_name"], _ = json.Marshal(name)
+						p["document_name"], _ = marshalNoEscape(name)
 					}
 				}
 				delete(p, "file")
@@ -951,7 +975,7 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 	if !changed {
 		return raw, false
 	}
-	out, err := json.Marshal(parts)
+	out, err := marshalNoEscape(parts)
 	if err != nil {
 		return raw, false
 	}
@@ -1103,7 +1127,7 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 					var existingStr string
 					if len(cTrim) > 0 && cTrim[0] == '[' && json.Unmarshal(cTrim, &existingList) == nil {
 						if !contentPartsHaveThinkingBlock(existingList) {
-							thinkChunk, _ := json.Marshal(map[string]any{
+							thinkChunk, _ := marshalNoEscape(map[string]any{
 								"type":   "thinking",
 								"closed": true,
 								"thinking": []map[string]string{
@@ -1111,10 +1135,10 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 								},
 							})
 							parts := append([]json.RawMessage{thinkChunk}, existingList...)
-							m["content"], _ = json.Marshal(parts)
+							m["content"], _ = marshalNoEscape(parts)
 						}
 					} else {
-						thinkChunk, _ := json.Marshal(map[string]any{
+						thinkChunk, _ := marshalNoEscape(map[string]any{
 							"type":   "thinking",
 							"closed": true,
 							"thinking": []map[string]string{
@@ -1123,10 +1147,10 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 						})
 						parts := []json.RawMessage{thinkChunk}
 						if json.Unmarshal(cTrim, &existingStr) == nil && existingStr != "" {
-							textChunk, _ := json.Marshal(map[string]string{"type": "text", "text": existingStr})
+							textChunk, _ := marshalNoEscape(map[string]string{"type": "text", "text": existingStr})
 							parts = append(parts, textChunk)
 						}
-						m["content"], _ = json.Marshal(parts)
+						m["content"], _ = marshalNoEscape(parts)
 					}
 				}
 			}
@@ -1146,7 +1170,7 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 							_ = json.Unmarshal(tc["id"], &origID)
 							normID := normalizeID(origID, "tc_"+strconv.Itoa(idx)+"_"+strconv.Itoa(tcIdx))
 							if normID != origID {
-								tc["id"], _ = json.Marshal(normID)
+								tc["id"], _ = marshalNoEscape(normID)
 								tcModified = true
 							}
 							for k := range tc {
@@ -1157,7 +1181,7 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 							}
 						}
 						if tcModified {
-							m["tool_calls"], _ = json.Marshal(tcList)
+							m["tool_calls"], _ = marshalNoEscape(tcList)
 							changed = true
 						}
 					}
@@ -1188,7 +1212,7 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 			_ = json.Unmarshal(m["tool_call_id"], &origID)
 			normID := normalizeID(origID, "tool_"+strconv.Itoa(idx))
 			if normID != origID {
-				m["tool_call_id"], _ = json.Marshal(normID)
+				m["tool_call_id"], _ = marshalNoEscape(normID)
 				changed = true
 			}
 			if _, hasContent := m["content"]; !hasContent || string(bytes.TrimSpace(m["content"])) == "null" {
@@ -1240,7 +1264,7 @@ func transformMessages(rawMsgs []json.RawMessage, cfg Config) (bool, []json.RawM
 	}
 	res := make([]json.RawMessage, 0, len(outMsgs))
 	for _, m := range outMsgs {
-		b, err := json.Marshal(m)
+		b, err := marshalNoEscape(m)
 		if err == nil {
 			res = append(res, b)
 		}
@@ -1330,7 +1354,7 @@ func normalizeToolParametersSchema(raw json.RawMessage) (json.RawMessage, bool) 
 	if !changed {
 		return raw, false
 	}
-	out, err := json.Marshal(normalized)
+	out, err := marshalNoEscape(normalized)
 	if err != nil {
 		return raw, false
 	}
@@ -1378,6 +1402,46 @@ func extractTypedContentParts(raw json.RawMessage) (text string, think string, i
 	return tb.String(), kb.String(), true
 }
 
+func hasNonEmptyToolCalls(m map[string]json.RawMessage) bool {
+	raw, ok := m["tool_calls"]
+	if !ok {
+		return false
+	}
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) && !bytes.Equal(trimmed, []byte("[]"))
+}
+
+func skipJSONSpace(b []byte, i int) int {
+	for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
+		i++
+	}
+	return i
+}
+
+// mayNeedMistralResponseChange performs a zero-allocation byte scan so normal
+// string-content chunks can skip JSON decoding altogether.
+func mayNeedMistralResponseChange(body []byte) bool {
+	if bytes.Contains(body, []byte(`"model_length"`)) || bytes.Contains(body, []byte(`"response_error"`)) {
+		return true
+	}
+	key := []byte(`"content"`)
+	rest := body
+	for {
+		i := bytes.Index(rest, key)
+		if i < 0 {
+			return false
+		}
+		rest = rest[i+len(key):]
+		j := skipJSONSpace(rest, 0)
+		if j < len(rest) && rest[j] == ':' {
+			j = skipJSONSpace(rest, j+1)
+			if j < len(rest) && rest[j] == '[' {
+				return true
+			}
+		}
+	}
+}
+
 func flattenMsgOrDelta(m map[string]json.RawMessage, isWholeMessage bool) bool {
 	if m == nil {
 		return false
@@ -1386,22 +1450,26 @@ func flattenMsgOrDelta(m map[string]json.RawMessage, isWholeMessage bool) bool {
 	if !isArr {
 		return false
 	}
-	if text != "" || isWholeMessage {
-		m["content"], _ = json.Marshal(text)
-	} else {
+	switch {
+	case text != "":
+		m["content"], _ = marshalNoEscape(text)
+	case !isWholeMessage:
 		delete(m, "content")
+	case hasNonEmptyToolCalls(m):
+		m["content"] = json.RawMessage("null")
+	default:
+		m["content"] = json.RawMessage(`""`)
 	}
 	if think != "" {
 		var existing string
 		_ = json.Unmarshal(m["reasoning_content"], &existing)
-		m["reasoning_content"], _ = json.Marshal(existing + think)
+		m["reasoning_content"], _ = marshalNoEscape(existing + think)
 	}
 	return true
 }
 
 func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
-	if !(bytes.Contains(raw, []byte(`"content"`)) && bytes.Contains(raw, []byte(`[`))) &&
-		!bytes.Contains(raw, []byte(`"model_length"`)) {
+	if !mayNeedMistralResponseChange(raw) {
 		return raw, false
 	}
 	var obj map[string]json.RawMessage
@@ -1419,17 +1487,21 @@ func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
 			c["finish_reason"] = json.RawMessage(`"length"`)
 			changed = true
 		}
+		if _, hasRespErr := c["response_error"]; hasRespErr {
+			delete(c, "response_error")
+			changed = true
+		}
 		if msgRaw, ok := c["message"]; ok && string(bytes.TrimSpace(msgRaw)) != "null" {
 			var msg map[string]json.RawMessage
 			if json.Unmarshal(msgRaw, &msg) == nil && flattenMsgOrDelta(msg, true) {
-				c["message"], _ = json.Marshal(msg)
+				c["message"], _ = marshalNoEscape(msg)
 				changed = true
 			}
 		}
 		if deltaRaw, ok := c["delta"]; ok && string(bytes.TrimSpace(deltaRaw)) != "null" {
 			var delta map[string]json.RawMessage
 			if json.Unmarshal(deltaRaw, &delta) == nil && flattenMsgOrDelta(delta, false) {
-				c["delta"], _ = json.Marshal(delta)
+				c["delta"], _ = marshalNoEscape(delta)
 				changed = true
 			}
 		}
@@ -1437,8 +1509,8 @@ func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
 	if !changed {
 		return raw, false
 	}
-	obj["choices"], _ = json.Marshal(choices)
-	out, err := json.Marshal(obj)
+	obj["choices"], _ = marshalNoEscape(choices)
+	out, err := marshalNoEscape(obj)
 	if err != nil {
 		return raw, false
 	}
@@ -1448,11 +1520,7 @@ func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
 // TransformMistralResponse converts Mistral streaming SSE chunks or non-streaming JSON responses
 // with typed thinking content arrays into standard OpenAI reasoning_content + string content.
 func TransformMistralResponse(body []byte, stream bool) ([]byte, bool) {
-	if len(body) == 0 {
-		return body, false
-	}
-	if !(bytes.Contains(body, []byte(`"content"`)) && bytes.Contains(body, []byte(`[`))) &&
-		!bytes.Contains(body, []byte(`"model_length"`)) {
+	if len(body) == 0 || !mayNeedMistralResponseChange(body) {
 		return body, false
 	}
 

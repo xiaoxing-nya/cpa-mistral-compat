@@ -786,3 +786,98 @@ func TestTransformMistralChatRequest_BareBase64InFilePartGetsDataURLPrefix(t *te
 		t.Fatalf("expected bare base64 png converted to image_url with data:image/png prefix, got %v", p2)
 	}
 }
+
+func TestTransformMistralResponse_ToolCallsThinkingOnlySetsNullContent(t *testing.T) {
+	raw := []byte(`{"id":"1","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call12345","type":"function","function":{"name":"ping","arguments":"{}"}}],"content":[{"type":"thinking","thinking":[{"type":"text","text":"need tool"}],"closed":true}]}}]}`)
+	out, chg := TransformMistralResponse(raw, false)
+	if !chg {
+		t.Fatal("expected rewrite")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	msg := got["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	val, exists := msg["content"]
+	if !exists || val != nil {
+		t.Fatalf("expected content: null when thinking-only + tool_calls, got exists=%v val=%#v out=%s", exists, val, out)
+	}
+	if msg["reasoning_content"] != "need tool" {
+		t.Fatalf("reasoning_content = %v, want 'need tool'", msg["reasoning_content"])
+	}
+}
+
+func TestTransformMistralResponse_StripsResponseErrorAndNoHTMLEscape(t *testing.T) {
+	// 1. Plain-string content chunk carrying non-standard Mistral response_error
+	plainWithErr := []byte(`data: {"id":"1","choices":[{"index":0,"delta":{"content":"a<b && c>d"},"finish_reason":"stop","response_error":{"format_error":null,"extra_tags":[]}}]}`)
+	out, chg := TransformMistralResponse(plainWithErr, true)
+	if !chg {
+		t.Fatal("expected response_error to be stripped")
+	}
+	if bytes.Contains(out, []byte(`"response_error"`)) {
+		t.Fatalf("response_error still present: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`"a<b && c>d"`)) {
+		t.Fatalf("HTML chars were unexpectedly escaped in plain chunk: %s", out)
+	}
+	// 2. HTML characters in both response and request outputs must NOT be escaped to < / > / &
+	arrWithHTML := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"thinking","thinking":[{"type":"text","text":"x<y && y>z"}]},{"type":"text","text":"a<b & c>d"}]}}]}`)
+	out2, chg2 := TransformMistralResponse(arrWithHTML, false)
+	if !chg2 {
+		t.Fatal("expected rewrite")
+	}
+	if !bytes.Contains(out2, []byte(`"a<b & c>d"`)) || !bytes.Contains(out2, []byte(`"x<y && y>z"`)) {
+		t.Fatalf("HTML chars were unexpectedly escaped in response: %s", out2)
+	}
+	reqHTML := []byte(`{"model":"mistral-large-4","store":false,"messages":[{"role":"user","content":"a<b & c>d"}]}`)
+	outReq, chgReq := TransformMistralChatRequest(reqHTML, "mistral-large-4", DefaultConfig())
+	if !chgReq {
+		t.Fatal("expected request rewrite")
+	}
+	if !bytes.Contains(outReq, []byte(`"a<b & c>d"`)) {
+		t.Fatalf("HTML chars were unexpectedly escaped in request: %s", outReq)
+	}
+}
+
+func TestTransformMistralChatRequest_OutputTextEmptyToolsAndDisabledPromptMode(t *testing.T) {
+	// 1. output_text -> text, empty tools[] + tool_choice -> dropped, disabled reasoning model drops prompt_mode
+	raw := []byte(`{
+		"model": "codestral-latest",
+		"prompt_mode": "reasoning",
+		"tools": [],
+		"tool_choice": "auto",
+		"messages": [
+			{"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+			{"role": "user", "content": "next"}
+		]
+	}`)
+	out, chg := TransformMistralChatRequest(raw, "codestral-latest", DefaultConfig())
+	if !chg {
+		t.Fatal("expected request to be sanitized")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, hasPM := got["prompt_mode"]; hasPM {
+		t.Fatalf("expected prompt_mode stripped on non-reasoning model codestral-latest: %s", out)
+	}
+	if _, hasTools := got["tools"]; hasTools {
+		t.Fatalf("expected empty tools[] removed: %s", out)
+	}
+	if _, hasTC := got["tool_choice"]; hasTC {
+		t.Fatalf("expected orphaned tool_choice removed when tools is empty: %s", out)
+	}
+	msg0 := got["messages"].([]any)[0].(map[string]any)
+	part0 := msg0["content"].([]any)[0].(map[string]any)
+	if part0["type"] != "text" {
+		t.Fatalf("expected output_text normalized to text, got %v", part0["type"])
+	}
+
+	// 2. Reasoning-capable model without reasoning_effort keeps prompt_mode
+	raw2 := []byte(`{"model":"mistral-large-4","prompt_mode":"reasoning","messages":[{"role":"user","content":"hi"}]}`)
+	out2, chg2 := TransformMistralChatRequest(raw2, "mistral-large-4", DefaultConfig())
+	if chg2 {
+		t.Fatalf("expected reasoning model without reasoning_effort to preserve prompt_mode, got %s", out2)
+	}
+}

@@ -6,9 +6,12 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -16,10 +19,11 @@ import (
 )
 
 const (
-	abiVersion    uint32 = 1
-	schemaVersion uint32 = 7
-	pluginName           = "cpa-mistral-compat"
-	pluginVersion        = "0.2.2"
+	abiVersion      uint32 = 1
+	schemaVersion   uint32 = 7
+	pluginName             = "cpa-mistral-compat"
+	pluginVersion          = "0.2.2"
+	maxRequestBytes        = 1 << 30
 )
 
 type envelope struct {
@@ -61,8 +65,6 @@ type capabilities struct {
 	RequestInterceptorOmitBodyBefore bool `json:"request_interceptor_omit_body_before,omitempty"`
 	RequestInterceptorOmitBodyAfter  bool `json:"request_interceptor_omit_body_after,omitempty"`
 	ResponseBeforeTranslator         bool `json:"response_before_translator"`
-	ResponseInterceptor              bool `json:"response_interceptor"`
-	StreamChunkInterceptor           bool `json:"response_stream_interceptor"`
 }
 
 type registrationResponse struct {
@@ -72,8 +74,9 @@ type registrationResponse struct {
 }
 
 var (
-	cfgMu     sync.RWMutex
-	activeCfg = DefaultConfig()
+	activeCfg atomic.Pointer[Config]
+
+	refreshMu sync.Mutex
 
 	discoveredMu             sync.RWMutex
 	mistralCredIDs           = map[string]bool{}
@@ -84,11 +87,31 @@ var (
 	hostAPICaller = callHostAPI
 )
 
+var (
+	emptyPayloadEnvelope   []byte
+	emptyInterceptEnvelope []byte
+)
+
+func init() {
+	def := DefaultConfig()
+	activeCfg.Store(&def)
+	emptyPayloadEnvelope, _ = okEnvelope(payloadResp{})
+	emptyInterceptEnvelope, _ = okEnvelope(requestInterceptResp{})
+}
+
 func main() {}
 
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) (rc C.int) {
+	defer func() {
+		if recover() != nil {
+			rc = 1
+		}
+	}()
 	if plugin == nil {
+		return 1
+	}
+	if host != nil && uint32(host.abi_version) != abiVersion {
 		return 1
 	}
 	C.cpa_store_host_api(host)
@@ -100,7 +123,16 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (rc C.int) {
+	defer func() {
+		if recover() != nil {
+			rc = 1
+			func() {
+				defer func() { _ = recover() }()
+				writeResponse(response, errorEnvelope("internal_error", "internal plugin panic"))
+			}()
+		}
+	}()
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
@@ -109,21 +141,29 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
+	if uint64(requestLen) > maxRequestBytes {
+		writeResponse(response, errorEnvelope("request_too_large", "request exceeds maximum size"))
+		return 1
+	}
 	var reqBytes []byte
 	if request != nil && requestLen > 0 {
-		reqBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+		// Read-only view valid only for the duration of this synchronous call.
+		reqBytes = unsafe.Slice((*byte)(unsafe.Pointer(request)), int(requestLen))
 	}
 	raw, err := handleMethod(C.GoString(method), reqBytes)
 	if err != nil {
 		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
 		return 1
 	}
-	writeResponse(response, raw)
+	if !writeResponse(response, raw) && len(raw) > 0 {
+		return 1
+	}
 	return 0
 }
 
 //export cliproxyPluginFree
 func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
+	defer func() { _ = recover() }()
 	if ptr != nil {
 		C.free(ptr)
 	}
@@ -131,31 +171,74 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	defer func() { _ = recover() }()
+	C.cpa_store_host_api(nil)
+}
 
 func getConfig() Config {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-	return activeCfg
+	if ptr := activeCfg.Load(); ptr != nil {
+		return *ptr
+	}
+	return DefaultConfig()
 }
 
 type pluginConfigYAML struct {
-	Enabled              *bool    `yaml:"enabled"`
-	Models               []string `yaml:"models"`
-	Providers            []string `yaml:"providers"`
-	NormalizeToolCallIDs *bool    `yaml:"normalize_tool_call_ids"`
-	ConvertThinking      *bool    `yaml:"convert_thinking_history"`
+	Enabled              *bool `yaml:"enabled"`
+	Models               any   `yaml:"models"`
+	Providers            any   `yaml:"providers"`
+	NormalizeToolCallIDs *bool `yaml:"normalize_tool_call_ids"`
+	ConvertThinking      *bool `yaml:"convert_thinking_history"`
 }
 
-func applyPluginConfigStruct(cfg *Config, pc pluginConfigYAML) {
+func parseStringListField(fieldName string, raw any) ([]string, error) {
+	switch v := raw.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		var out []string
+		for _, part := range strings.Split(v, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	case []any:
+		var out []string
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("%s: every entry must be a string", fieldName)
+			}
+			for _, part := range strings.Split(s, ",") {
+				if trimmed := strings.TrimSpace(part); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("%s: expected a list of strings or a comma-separated string", fieldName)
+	}
+}
+
+func applyPluginConfigStruct(cfg *Config, pc pluginConfigYAML) error {
 	if pc.Enabled != nil {
 		cfg.Enabled = *pc.Enabled
 	}
-	if len(pc.Models) > 0 {
-		cfg.Models = append(cfg.Models, pc.Models...)
+	models, err := parseStringListField("models", pc.Models)
+	if err != nil {
+		return err
 	}
-	if len(pc.Providers) > 0 {
-		cfg.Providers = append(cfg.Providers, pc.Providers...)
+	if len(models) > 0 {
+		cfg.Models = append(cfg.Models, models...)
+	}
+	providers, err := parseStringListField("providers", pc.Providers)
+	if err != nil {
+		return err
+	}
+	if len(providers) > 0 {
+		cfg.Providers = append(cfg.Providers, providers...)
 	}
 	if pc.NormalizeToolCallIDs != nil {
 		cfg.NormalizeToolCallIDs = *pc.NormalizeToolCallIDs
@@ -163,33 +246,42 @@ func applyPluginConfigStruct(cfg *Config, pc pluginConfigYAML) {
 	if pc.ConvertThinking != nil {
 		cfg.ConvertThinkingHistory = *pc.ConvertThinking
 	}
+	return nil
 }
 
-func updateConfigFromYAML(raw []byte) {
+func updateConfigFromYAML(raw []byte) error {
 	cfg := DefaultConfig()
-	if len(raw) > 0 {
-		var direct pluginConfigYAML
-		if yaml.Unmarshal(raw, &direct) == nil {
-			applyPluginConfigStruct(&cfg, direct)
-		}
+	if len(bytes.TrimSpace(raw)) > 0 {
 		var root struct {
-			Plugins struct {
+			Plugins *struct {
 				Configs map[string]pluginConfigYAML `yaml:"configs"`
 			} `yaml:"plugins"`
 		}
-		if yaml.Unmarshal(raw, &root) == nil {
+		if err := yaml.Unmarshal(raw, &root); err != nil {
+			return fmt.Errorf("invalid config yaml: %w", err)
+		}
+		if root.Plugins != nil {
 			if pc, ok := root.Plugins.Configs[pluginName]; ok {
-				applyPluginConfigStruct(&cfg, pc)
+				if err := applyPluginConfigStruct(&cfg, pc); err != nil {
+					return err
+				}
+			}
+		} else {
+			var direct pluginConfigYAML
+			if err := yaml.Unmarshal(raw, &direct); err != nil {
+				return fmt.Errorf("invalid config yaml: %w", err)
+			}
+			if err := applyPluginConfigStruct(&cfg, direct); err != nil {
+				return err
 			}
 		}
 	}
-	cfgMu.Lock()
-	activeCfg = cfg
-	cfgMu.Unlock()
+	activeCfg.Store(&cfg)
 
 	discoveredMu.Lock()
 	lastDiscovery = time.Time{}
 	discoveredMu.Unlock()
+	return nil
 }
 
 func buildRegistration() ([]byte, error) {
@@ -234,8 +326,6 @@ func buildRegistration() ([]byte, error) {
 			RequestInterceptorOmitBodyBefore: true,
 			RequestInterceptorOmitBodyAfter:  false,
 			ResponseBeforeTranslator:         true,
-			ResponseInterceptor:              true,
-			StreamChunkInterceptor:           true,
 		},
 	}
 	return okEnvelope(reg)
@@ -275,21 +365,47 @@ type requestInterceptResp struct {
 	Body []byte `json:"Body,omitempty"`
 }
 
-type responseInterceptReq struct {
-	Body []byte `json:"Body"`
-}
+var (
+	markOriginal = []byte(`,"OriginalRequest":`)
+	markBody     = []byte(`,"Body":`)
+)
 
-type responseInterceptResp struct {
-	Body []byte `json:"Body,omitempty"`
-}
-
-type streamChunkInterceptReq struct {
-	Body       []byte `json:"Body"`
-	ChunkIndex int    `json:"ChunkIndex"`
-}
-
-type streamChunkInterceptResp struct {
-	Body []byte `json:"Body,omitempty"`
+// decodeResponseTransformRequest extracts header fields and trailing Body
+// without scanning large OriginalRequest / TranslatedRequest base64 payloads.
+// Falls back to full json.Unmarshal if field order differs from the host encoder.
+func decodeResponseTransformRequest(request []byte) (responseTransformReq, error) {
+	var req responseTransformReq
+	trimmed := bytes.TrimSpace(request)
+	i := bytes.Index(trimmed, markOriginal)
+	j := bytes.LastIndex(trimmed, markBody)
+	if i > 0 && j > i && bytes.HasSuffix(trimmed, []byte("}")) {
+		header := make([]byte, 0, i+1)
+		header = append(header, trimmed[:i]...)
+		header = append(header, '}')
+		var head struct {
+			FromFormat string `json:"FromFormat"`
+			ToFormat   string `json:"ToFormat"`
+			Model      string `json:"Model"`
+			Stream     bool   `json:"Stream"`
+		}
+		if json.Unmarshal(header, &head) == nil {
+			req.FromFormat = head.FromFormat
+			req.ToFormat = head.ToFormat
+			req.Model = head.Model
+			req.Stream = head.Stream
+			fromFmt := strings.ToLower(strings.TrimSpace(head.FromFormat))
+			if fromFmt != "" && fromFmt != "openai" {
+				return req, nil
+			}
+			var body []byte
+			if json.Unmarshal(trimmed[j+len(markBody):len(trimmed)-1], &body) == nil {
+				req.Body = body
+				return req, nil
+			}
+		}
+	}
+	err := json.Unmarshal(request, &req)
+	return req, err
 }
 
 func stringFromMetadata(meta map[string]any, key string) string {
@@ -321,6 +437,9 @@ func markCrossProtoMistralTarget(fromFmt, model string) {
 		if now.Sub(ts) > 60*time.Second {
 			delete(crossProtoMistralTargets, oldKey)
 		}
+	}
+	if len(crossProtoMistralTargets) >= 512 {
+		clear(crossProtoMistralTargets)
 	}
 	crossProtoMistralTargets[k] = now
 	discoveredMu.Unlock()
@@ -356,8 +475,12 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 	case "plugin.register", "plugin.reconfigure":
 		var lr lifecycleRequest
 		if len(reqBytes) > 0 {
-			_ = json.Unmarshal(reqBytes, &lr)
-			updateConfigFromYAML(lr.ConfigYAML)
+			if err := json.Unmarshal(reqBytes, &lr); err != nil {
+				return errorEnvelope("bad_request", "decode lifecycle request"), nil
+			}
+			if err := updateConfigFromYAML(lr.ConfigYAML); err != nil {
+				return errorEnvelope("invalid_config", err.Error()), nil
+			}
 		}
 		return buildRegistration()
 
@@ -373,20 +496,20 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 				refreshCredentials(req.HostCallbackID, "", "", cfg)
 			}
 		}
-		return okEnvelope(requestInterceptResp{})
+		return emptyInterceptEnvelope, nil
 
 	case "request.intercept_after":
 		var req requestInterceptReq
 		if json.Unmarshal(reqBytes, &req) != nil {
-			return okEnvelope(requestInterceptResp{})
+			return emptyInterceptEnvelope, nil
 		}
 		cfg := getConfig()
 		if !cfg.Enabled {
-			return okEnvelope(requestInterceptResp{})
+			return emptyInterceptEnvelope, nil
 		}
 		toFmt := strings.ToLower(strings.TrimSpace(req.ToFormat))
 		if toFmt != "" && toFmt != "openai" {
-			return okEnvelope(requestInterceptResp{})
+			return emptyInterceptEnvelope, nil
 		}
 
 		authID := stringFromMetadata(req.Metadata, "selected_auth_id")
@@ -408,12 +531,12 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 			if srcFmt != "" && srcFmt != "openai" {
 				clearCrossProtoMistralTarget(srcFmt, req.Model)
 			}
-			return okEnvelope(requestInterceptResp{})
+			return emptyInterceptEnvelope, nil
 		}
 
 		if srcFmt == "" || srcFmt == "openai" {
 			if len(req.Body) == 0 {
-				return okEnvelope(requestInterceptResp{})
+				return emptyInterceptEnvelope, nil
 			}
 			model := req.Model
 			if model == "" {
@@ -422,7 +545,7 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 			if out, changed := TransformMistralChatRequest(req.Body, model, cfg); changed {
 				return okEnvelope(requestInterceptResp{Body: out})
 			}
-			return okEnvelope(requestInterceptResp{})
+			return emptyInterceptEnvelope, nil
 		}
 
 		// Cross-protocol request (claude / openai-response / gemini -> openai):
@@ -434,75 +557,51 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 				return okEnvelope(requestInterceptResp{Body: out})
 			}
 		}
-		return okEnvelope(requestInterceptResp{})
+		return emptyInterceptEnvelope, nil
 
 	case "request.normalize":
 		var req requestTransformReq
 		if err := json.Unmarshal(reqBytes, &req); err != nil {
-			return okEnvelope(payloadResp{})
+			return emptyPayloadEnvelope, nil
 		}
 		cfg := getConfig()
 		if !cfg.Enabled || len(req.Body) == 0 {
-			return okEnvelope(payloadResp{})
+			return emptyPayloadEnvelope, nil
 		}
 		toFmt := strings.ToLower(strings.TrimSpace(req.ToFormat))
 		if toFmt != "" && toFmt != "openai" {
-			return okEnvelope(payloadResp{})
+			return emptyPayloadEnvelope, nil
 		}
 		fromFmt := strings.ToLower(strings.TrimSpace(req.FromFormat))
 		// Same-protocol OpenAI requests are already gated by selected_auth_id and normalized in request.intercept_after.
 		if fromFmt == "" || fromFmt == "openai" {
-			return okEnvelope(payloadResp{})
+			return emptyPayloadEnvelope, nil
 		}
 		if !isCrossProtoMistralTarget(fromFmt, req.Model) {
-			return okEnvelope(payloadResp{})
+			return emptyPayloadEnvelope, nil
 		}
 		if out, changed := TransformMistralChatRequest(req.Body, req.Model, cfg); changed {
 			return okEnvelope(payloadResp{Body: out})
 		}
-		return okEnvelope(payloadResp{})
+		return emptyPayloadEnvelope, nil
 
 	case "response.normalize_before":
-		var req responseTransformReq
-		if err := json.Unmarshal(reqBytes, &req); err != nil {
-			return okEnvelope(payloadResp{})
-		}
 		cfg := getConfig()
-		if !cfg.Enabled || len(req.Body) == 0 {
-			return okEnvelope(payloadResp{})
+		if !cfg.Enabled {
+			return emptyPayloadEnvelope, nil
+		}
+		req, err := decodeResponseTransformRequest(reqBytes)
+		if err != nil || len(req.Body) == 0 {
+			return emptyPayloadEnvelope, nil
+		}
+		fromFmt := strings.ToLower(strings.TrimSpace(req.FromFormat))
+		if fromFmt != "" && fromFmt != "openai" {
+			return emptyPayloadEnvelope, nil
 		}
 		if out, changed := TransformMistralResponse(req.Body, req.Stream); changed {
 			return okEnvelope(payloadResp{Body: out})
 		}
-		return okEnvelope(payloadResp{})
-
-	case "response.intercept_after":
-		var req responseInterceptReq
-		if err := json.Unmarshal(reqBytes, &req); err != nil {
-			return okEnvelope(responseInterceptResp{})
-		}
-		cfg := getConfig()
-		if !cfg.Enabled || len(req.Body) == 0 {
-			return okEnvelope(responseInterceptResp{})
-		}
-		if out, changed := TransformMistralResponse(req.Body, false); changed {
-			return okEnvelope(responseInterceptResp{Body: out})
-		}
-		return okEnvelope(responseInterceptResp{})
-
-	case "response.intercept_stream_chunk":
-		var req streamChunkInterceptReq
-		if err := json.Unmarshal(reqBytes, &req); err != nil {
-			return okEnvelope(streamChunkInterceptResp{})
-		}
-		cfg := getConfig()
-		if !cfg.Enabled || req.ChunkIndex < 0 || len(req.Body) == 0 {
-			return okEnvelope(streamChunkInterceptResp{})
-		}
-		if out, changed := TransformMistralResponse(req.Body, true); changed {
-			return okEnvelope(streamChunkInterceptResp{Body: out})
-		}
-		return okEnvelope(streamChunkInterceptResp{})
+		return emptyPayloadEnvelope, nil
 
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
@@ -515,7 +614,10 @@ func callHostAPI(method string, payload []byte) ([]byte, bool) {
 	var resp C.cliproxy_buffer
 	var reqPtr *C.uint8_t
 	if len(payload) > 0 {
-		reqPtr = (*C.uint8_t)(C.CBytes(payload))
+		reqPtr = (*C.uint8_t)(C.cpa_copy_out(unsafe.Pointer(&payload[0]), C.size_t(len(payload))))
+		if reqPtr == nil {
+			return nil, false
+		}
 		defer C.free(unsafe.Pointer(reqPtr))
 	}
 	rc := C.cpa_call_host_api(cMethod, reqPtr, C.size_t(len(payload)), &resp)
@@ -558,11 +660,7 @@ func isMistralCredential(authID, authIndex string) bool {
 	return false
 }
 
-func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
-	if callbackID == "" {
-		return
-	}
-	discoveredMu.RLock()
+func isCredentialsFreshLocked(unseenID1, unseenID2 string) bool {
 	fresh := time.Since(lastDiscovery) < 15*time.Second && len(knownCredIDs) > 0
 	if fresh && unseenID1 != "" && !knownCredIDs[unseenID1] {
 		fresh = false
@@ -570,6 +668,25 @@ func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
 	if fresh && unseenID2 != "" && !knownCredIDs[unseenID2] {
 		fresh = false
 	}
+	return fresh
+}
+
+func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
+	if callbackID == "" {
+		return
+	}
+	discoveredMu.RLock()
+	fresh := isCredentialsFreshLocked(unseenID1, unseenID2)
+	discoveredMu.RUnlock()
+	if fresh {
+		return
+	}
+
+	refreshMu.Lock()
+	defer refreshMu.Unlock()
+
+	discoveredMu.RLock()
+	fresh = isCredentialsFreshLocked(unseenID1, unseenID2)
 	discoveredMu.RUnlock()
 	if fresh {
 		return
@@ -650,26 +767,27 @@ func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
 }
 
 func okEnvelope(v any) ([]byte, error) {
-	raw, err := json.Marshal(v)
+	raw, err := marshalNoEscape(v)
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(envelope{OK: true, Result: raw})
+	return marshalNoEscape(envelope{OK: true, Result: raw})
 }
 
 func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	raw, _ := marshalNoEscape(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
 	return raw
 }
 
-func writeResponse(response *C.cliproxy_buffer, raw []byte) {
+func writeResponse(response *C.cliproxy_buffer, raw []byte) bool {
 	if response == nil || len(raw) == 0 {
-		return
+		return false
 	}
-	ptr := C.CBytes(raw)
+	ptr := C.cpa_copy_out(unsafe.Pointer(&raw[0]), C.size_t(len(raw)))
 	if ptr == nil {
-		return
+		return false
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+	return true
 }
