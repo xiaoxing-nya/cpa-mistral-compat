@@ -813,6 +813,81 @@ func extractMessageReasoning(m map[string]json.RawMessage) string {
 	return ""
 }
 
+func inferMIMETypeFromFilename(filename, data string) string {
+	name := strings.ToLower(strings.TrimSpace(filename))
+	clean := strings.SplitN(strings.SplitN(name, "?", 2)[0], "#", 2)[0]
+	switch path.Ext(clean) {
+	case ".pdf":
+		return "application/pdf"
+	case ".txt", ".md", ".log":
+		return "text/plain"
+	case ".csv":
+		return "text/csv"
+	case ".json":
+		return "application/json"
+	case ".html", ".htm":
+		return "text/html"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".bmp":
+		return "image/bmp"
+	case ".tiff", ".tif":
+		return "image/tiff"
+	}
+	trimmed := strings.TrimSpace(data)
+	switch {
+	case strings.HasPrefix(trimmed, "JVBERi"):
+		return "application/pdf"
+	case strings.HasPrefix(trimmed, "iVBORw0KGgo"):
+		return "image/png"
+	case strings.HasPrefix(trimmed, "/9j/"):
+		return "image/jpeg"
+	case strings.HasPrefix(trimmed, "UklGR"):
+		return "image/webp"
+	case strings.HasPrefix(trimmed, "R0lGOD"):
+		return "image/gif"
+	}
+	return "application/octet-stream"
+}
+
+func normalizeFilePartDataURL(val, filename string) string {
+	trimmed := strings.TrimSpace(val)
+	low := strings.ToLower(trimmed)
+	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") || strings.HasPrefix(low, "data:") {
+		return trimmed
+	}
+	mime := inferMIMETypeFromFilename(filename, trimmed)
+	return "data:" + mime + ";base64," + trimmed
+}
+
+func isImageFilePart(urlOrData, filename string) bool {
+	low := strings.ToLower(strings.TrimSpace(urlOrData))
+	if strings.HasPrefix(low, "data:image/") {
+		return true
+	}
+	for _, target := range []string{low, strings.ToLower(strings.TrimSpace(filename))} {
+		clean := strings.SplitN(strings.SplitN(target, "?", 2)[0], "#", 2)[0]
+		for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"} {
+			if strings.HasSuffix(clean, ext) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
@@ -855,10 +930,16 @@ func sanitizeContentParts(raw json.RawMessage) (json.RawMessage, bool) {
 				}
 			}
 			if docURL != "" {
-				p["type"] = json.RawMessage(`"document_url"`)
-				p["document_url"], _ = json.Marshal(docURL)
-				if name := strings.TrimSpace(fileObj.Filename); name != "" {
-					p["document_name"], _ = json.Marshal(name)
+				docURL = normalizeFilePartDataURL(docURL, fileObj.Filename)
+				if isImageFilePart(docURL, fileObj.Filename) {
+					p["type"] = json.RawMessage(`"image_url"`)
+					p["image_url"], _ = json.Marshal(map[string]string{"url": docURL})
+				} else {
+					p["type"] = json.RawMessage(`"document_url"`)
+					p["document_url"], _ = json.Marshal(docURL)
+					if name := strings.TrimSpace(fileObj.Filename); name != "" {
+						p["document_name"], _ = json.Marshal(name)
+					}
 				}
 				delete(p, "file")
 				delete(p, "file_data")

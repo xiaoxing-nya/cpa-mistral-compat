@@ -709,3 +709,80 @@ func TestTransformMistralChatRequest_StructuredOutputSchemaAndFileToDocumentURL(
 		t.Fatalf("expected file_url part converted to document_url, got %v", p2)
 	}
 }
+
+func TestTransformMistralChatRequest_ImageInFilePartConvertsToImageURLAndNormalImageUntouched(t *testing.T) {
+	raw := []byte(`{
+		"model": "mistral-large-4",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "Inspect both images"},
+					{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA="}},
+					{"type": "file", "file": {"filename": "shot.png", "file_data": "data:image/png;base64,BBB="}},
+					{"type": "file", "file": {"filename": "doc.pdf", "file_data": "data:application/pdf;base64,JVBERi0="}}
+				]
+			}
+		]
+	}`)
+	out, changed := TransformMistralChatRequest(raw, "mistral-large-4", DefaultConfig())
+	if !changed {
+		t.Fatal("expected request to change")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	parts := got["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	// 1. Existing image_url untouched
+	p1 := parts[1].(map[string]any)
+	if p1["type"] != "image_url" || p1["image_url"].(map[string]any)["url"] != "data:image/png;base64,AAA=" {
+		t.Fatalf("existing image_url mutated unexpectedly: %v", p1)
+	}
+	// 2. image/png wrapped in file part -> image_url (NOT document_url)
+	p2 := parts[2].(map[string]any)
+	if p2["type"] != "image_url" || p2["image_url"].(map[string]any)["url"] != "data:image/png;base64,BBB=" {
+		t.Fatalf("expected image file part converted to image_url, got %v", p2)
+	}
+	if _, hasDoc := p2["document_url"]; hasDoc {
+		t.Fatalf("image must not become document_url: %v", p2)
+	}
+	// 3. PDF file part -> document_url
+	p3 := parts[3].(map[string]any)
+	if p3["type"] != "document_url" || p3["document_url"] != "data:application/pdf;base64,JVBERi0=" || p3["document_name"] != "doc.pdf" {
+		t.Fatalf("expected pdf file part converted to document_url, got %v", p3)
+	}
+}
+
+func TestTransformMistralChatRequest_BareBase64InFilePartGetsDataURLPrefix(t *testing.T) {
+	raw := []byte(`{
+		"model": "mistral-large-4",
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type": "file", "file": {"filename": "document.pdf", "file_data": "JVBERi0xLjQK"}},
+				{"type": "file", "file": {"filename": "note.txt", "file_data": "SGVsbG8="}},
+				{"type": "file", "file": {"filename": "img.png", "file_data": "iVBORw0KGgo="}}
+			]
+		}]
+	}`)
+	out, changed := TransformMistralChatRequest(raw, "mistral-large-4", DefaultConfig())
+	if !changed {
+		t.Fatal("expected request to change")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	parts := got["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if parts[0].(map[string]any)["document_url"] != "data:application/pdf;base64,JVBERi0xLjQK" {
+		t.Fatalf("expected application/pdf data URL prefix, got %v", parts[0])
+	}
+	if parts[1].(map[string]any)["document_url"] != "data:text/plain;base64,SGVsbG8=" {
+		t.Fatalf("expected text/plain data URL prefix, got %v", parts[1])
+	}
+	p2 := parts[2].(map[string]any)
+	if p2["type"] != "image_url" || p2["image_url"].(map[string]any)["url"] != "data:image/png;base64,iVBORw0KGgo=" {
+		t.Fatalf("expected bare base64 png converted to image_url with data:image/png prefix, got %v", p2)
+	}
+}
