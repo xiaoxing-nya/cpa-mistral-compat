@@ -81,6 +81,11 @@ var (
 	discoveredMu             sync.RWMutex
 	mistralCredIDs           = map[string]bool{}
 	knownCredIDs             = map[string]bool{}
+	mistralResponseModels    = map[string]bool{}
+	nonMistralResponseModels = map[string]bool{}
+	// Keyed by (SourceFormat, upstreamModel) with a 60s TTL because CPA's
+	// RequestTransformRequest carries no RequestID; concurrent Mistral and
+	// non-Mistral requests on the exact same pair share a known narrow race window.
 	crossProtoMistralTargets = map[string]time.Time{}
 	lastDiscovery            time.Time
 
@@ -470,6 +475,47 @@ func isCrossProtoMistralTarget(fromFmt, model string) bool {
 	return now.Sub(ts) <= 60*time.Second
 }
 
+func normResponseModelKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(stripThinkingSuffix(model)))
+}
+
+func noteObservedResponseModel(model string, isMistral bool) {
+	k := normResponseModelKey(model)
+	if k == "" {
+		return
+	}
+	discoveredMu.Lock()
+	if isMistral {
+		if !nonMistralResponseModels[k] {
+			if len(mistralResponseModels) >= 512 {
+				clear(mistralResponseModels)
+			}
+			mistralResponseModels[k] = true
+		}
+	} else {
+		if len(nonMistralResponseModels) >= 512 {
+			clear(nonMistralResponseModels)
+		}
+		nonMistralResponseModels[k] = true
+		delete(mistralResponseModels, k)
+	}
+	discoveredMu.Unlock()
+}
+
+func allowTextOnlyResponseFlatten(model string, cfg Config) bool {
+	if IsMistralTarget(model, "", "", nil, cfg) {
+		return true
+	}
+	k := normResponseModelKey(model)
+	if k == "" {
+		return false
+	}
+	discoveredMu.RLock()
+	ok := mistralResponseModels[k] && !nonMistralResponseModels[k]
+	discoveredMu.RUnlock()
+	return ok
+}
+
 func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
@@ -478,9 +524,9 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 			if err := json.Unmarshal(reqBytes, &lr); err != nil {
 				return errorEnvelope("bad_request", "decode lifecycle request"), nil
 			}
-			if err := updateConfigFromYAML(lr.ConfigYAML); err != nil {
-				return errorEnvelope("invalid_config", err.Error()), nil
-			}
+		}
+		if err := updateConfigFromYAML(lr.ConfigYAML); err != nil {
+			return errorEnvelope("invalid_config", err.Error()), nil
 		}
 		return buildRegistration()
 
@@ -527,6 +573,9 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 		}
 
 		srcFmt := strings.ToLower(strings.TrimSpace(req.SourceFormat))
+		if req.Model != "" {
+			noteObservedResponseModel(req.Model, isMistral)
+		}
 		if !isMistral {
 			if srcFmt != "" && srcFmt != "openai" {
 				clearCrossProtoMistralTarget(srcFmt, req.Model)
@@ -598,7 +647,8 @@ func handleMethod(method string, reqBytes []byte) ([]byte, error) {
 		if fromFmt != "" && fromFmt != "openai" {
 			return emptyPayloadEnvelope, nil
 		}
-		if out, changed := TransformMistralResponse(req.Body, req.Stream); changed {
+		allowTextOnly := allowTextOnlyResponseFlatten(req.Model, cfg)
+		if out, changed := TransformMistralResponseScoped(req.Body, req.Stream, allowTextOnly); changed {
 			return okEnvelope(payloadResp{Body: out})
 		}
 		return emptyPayloadEnvelope, nil
@@ -621,10 +671,12 @@ func callHostAPI(method string, payload []byte) ([]byte, bool) {
 		defer C.free(unsafe.Pointer(reqPtr))
 	}
 	rc := C.cpa_call_host_api(cMethod, reqPtr, C.size_t(len(payload)), &resp)
+	if resp.ptr != nil {
+		defer C.cpa_free_host_buffer(resp.ptr, resp.len)
+	}
 	if rc != 0 || resp.ptr == nil {
 		return nil, false
 	}
-	defer C.cpa_free_host_buffer(resp.ptr, resp.len)
 	out := C.GoBytes(resp.ptr, C.int(resp.len))
 	var env envelope
 	if json.Unmarshal(out, &env) != nil || !env.OK {
@@ -759,9 +811,31 @@ func refreshCredentials(callbackID, unseenID1, unseenID2 string, cfg Config) {
 		}
 	}
 
+	nextMistralModels := map[string]bool{}
+	nextNonMistralModels := map[string]bool{}
+	for _, c := range modelsResp.Credentials {
+		isM := nextMistral[c.ID] || nextMistral[c.AuthIndex] || isMistralProviderKey(c.Provider, "", cfg)
+		for _, m := range c.Models {
+			k := normResponseModelKey(m)
+			if k == "" {
+				continue
+			}
+			if isM {
+				if !nextNonMistralModels[k] {
+					nextMistralModels[k] = true
+				}
+			} else {
+				nextNonMistralModels[k] = true
+				delete(nextMistralModels, k)
+			}
+		}
+	}
+
 	discoveredMu.Lock()
 	mistralCredIDs = nextMistral
 	knownCredIDs = nextKnown
+	mistralResponseModels = nextMistralModels
+	nonMistralResponseModels = nextNonMistralModels
 	lastDiscovery = time.Now()
 	discoveredMu.Unlock()
 }

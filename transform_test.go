@@ -881,3 +881,21 @@ func TestTransformMistralChatRequest_OutputTextEmptyToolsAndDisabledPromptMode(t
 		t.Fatalf("expected reasoning model without reasoning_effort to preserve prompt_mode, got %s", out2)
 	}
 }
+
+func TestTransformMistralChatRequest_DropsNullToolsAndServiceTier(t *testing.T) {
+	raw := []byte(`{"model":"mistral-large-4","tools":null,"service_tier":null,"messages":[{"role":"user","content":"hi"}]}`)
+	out, chg := TransformMistralChatRequest(raw, "mistral-large-4", DefaultConfig())
+	if !chg {
+		t.Fatal("expected null tools and service_tier to be stripped")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := got["tools"]; exists {
+		t.Fatalf("tools:null survived: %s", out)
+	}
+	if _, exists := got["service_tier"]; exists {
+		t.Fatalf("service_tier:null survived: %s", out)
+	}
+}

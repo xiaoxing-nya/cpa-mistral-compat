@@ -608,7 +608,7 @@ func TransformMistralChatRequest(body []byte, envelopeModel string, cfg Config) 
 	}
 
 	// 3b. Drop null values on strict Mistral fields and resolve max_tokens/max_completion_tokens conflict
-	for _, nonNullField := range []string{"response_format", "parallel_tool_calls", "tool_choice"} {
+	for _, nonNullField := range []string{"response_format", "parallel_tool_calls", "tool_choice", "tools", "service_tier"} {
 		if rawVal, exists := root[nonNullField]; exists && string(bytes.TrimSpace(rawVal)) == "null" {
 			delete(root, nonNullField)
 			changed = true
@@ -1362,10 +1362,10 @@ func normalizeToolParametersSchema(raw json.RawMessage) (json.RawMessage, bool) 
 }
 
 // extractTypedContentParts extracts plain text and thinking text from Mistral's polymorphic content array.
-func extractTypedContentParts(raw json.RawMessage) (text string, think string, isArray bool) {
+func extractTypedContentParts(raw json.RawMessage) (text string, think string, hasThinking bool, isArray bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
-		return "", "", false
+		return "", "", false, false
 	}
 	var parts []struct {
 		Type     string          `json:"type"`
@@ -1373,7 +1373,7 @@ func extractTypedContentParts(raw json.RawMessage) (text string, think string, i
 		Thinking json.RawMessage `json:"thinking"`
 	}
 	if err := json.Unmarshal(trimmed, &parts); err != nil {
-		return "", "", false
+		return "", "", false, false
 	}
 	var tb, kb strings.Builder
 	for _, p := range parts {
@@ -1381,6 +1381,7 @@ func extractTypedContentParts(raw json.RawMessage) (text string, think string, i
 		case "text":
 			tb.WriteString(p.Text)
 		case "thinking":
+			hasThinking = true
 			var s string
 			if json.Unmarshal(p.Thinking, &s) == nil {
 				kb.WriteString(s)
@@ -1396,10 +1397,10 @@ func extractTypedContentParts(raw json.RawMessage) (text string, think string, i
 			}
 		default:
 			// Preserve multimodal/unknown blocks (e.g. image_url, audio, refusal) untouched.
-			return "", "", false
+			return "", "", false, false
 		}
 	}
-	return tb.String(), kb.String(), true
+	return tb.String(), kb.String(), hasThinking, true
 }
 
 func hasNonEmptyToolCalls(m map[string]json.RawMessage) bool {
@@ -1442,12 +1443,12 @@ func mayNeedMistralResponseChange(body []byte) bool {
 	}
 }
 
-func flattenMsgOrDelta(m map[string]json.RawMessage, isWholeMessage bool) bool {
+func flattenMsgOrDelta(m map[string]json.RawMessage, isWholeMessage, allowTextOnlyFlatten bool) bool {
 	if m == nil {
 		return false
 	}
-	text, think, isArr := extractTypedContentParts(m["content"])
-	if !isArr {
+	text, think, hasThinking, isArr := extractTypedContentParts(m["content"])
+	if !isArr || (!hasThinking && !allowTextOnlyFlatten) {
 		return false
 	}
 	switch {
@@ -1468,7 +1469,7 @@ func flattenMsgOrDelta(m map[string]json.RawMessage, isWholeMessage bool) bool {
 	return true
 }
 
-func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
+func transformSingleJSONResponse(raw []byte, allowTextOnlyFlatten bool) ([]byte, bool) {
 	if !mayNeedMistralResponseChange(raw) {
 		return raw, false
 	}
@@ -1493,14 +1494,14 @@ func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
 		}
 		if msgRaw, ok := c["message"]; ok && string(bytes.TrimSpace(msgRaw)) != "null" {
 			var msg map[string]json.RawMessage
-			if json.Unmarshal(msgRaw, &msg) == nil && flattenMsgOrDelta(msg, true) {
+			if json.Unmarshal(msgRaw, &msg) == nil && flattenMsgOrDelta(msg, true, allowTextOnlyFlatten) {
 				c["message"], _ = marshalNoEscape(msg)
 				changed = true
 			}
 		}
 		if deltaRaw, ok := c["delta"]; ok && string(bytes.TrimSpace(deltaRaw)) != "null" {
 			var delta map[string]json.RawMessage
-			if json.Unmarshal(deltaRaw, &delta) == nil && flattenMsgOrDelta(delta, false) {
+			if json.Unmarshal(deltaRaw, &delta) == nil && flattenMsgOrDelta(delta, false, allowTextOnlyFlatten) {
 				c["delta"], _ = marshalNoEscape(delta)
 				changed = true
 			}
@@ -1520,13 +1521,19 @@ func transformSingleJSONResponse(raw []byte) ([]byte, bool) {
 // TransformMistralResponse converts Mistral streaming SSE chunks or non-streaming JSON responses
 // with typed thinking content arrays into standard OpenAI reasoning_content + string content.
 func TransformMistralResponse(body []byte, stream bool) ([]byte, bool) {
+	return TransformMistralResponseScoped(body, stream, true)
+}
+
+// TransformMistralResponseScoped behaves like TransformMistralResponse, except text-only
+// content chunk lists (without any thinking chunk) are flattened only when allowTextOnlyFlatten is true.
+func TransformMistralResponseScoped(body []byte, stream, allowTextOnlyFlatten bool) ([]byte, bool) {
 	if len(body) == 0 || !mayNeedMistralResponseChange(body) {
 		return body, false
 	}
 
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
-		return transformSingleJSONResponse(body)
+		return transformSingleJSONResponse(body, allowTextOnlyFlatten)
 	}
 
 	lines := bytes.Split(body, []byte("\n"))
@@ -1542,7 +1549,7 @@ func TransformMistralResponse(body []byte, stream bool) ([]byte, bool) {
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || payload[0] != '{' {
 			continue
 		}
-		if newPayload, chg := transformSingleJSONResponse(payload); chg {
+		if newPayload, chg := transformSingleJSONResponse(payload, allowTextOnlyFlatten); chg {
 			newLine := append([]byte("data: "), newPayload...)
 			if cr {
 				newLine = append(newLine, '\r')

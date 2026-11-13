@@ -16,6 +16,8 @@ func resetPluginStateForTest() {
 	discoveredMu.Lock()
 	mistralCredIDs = map[string]bool{}
 	knownCredIDs = map[string]bool{}
+	mistralResponseModels = map[string]bool{}
+	nonMistralResponseModels = map[string]bool{}
 	crossProtoMistralTargets = map[string]time.Time{}
 	lastDiscovery = time.Now()
 	discoveredMu.Unlock()
@@ -467,5 +469,116 @@ func BenchmarkResponseNormalizeBefore_TransitionChunk(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _ = handleMethod("response.normalize_before", req)
+	}
+}
+
+func TestResponseNormalizeBefore_ModelScopingAndTextArrayProtection(t *testing.T) {
+	resetPluginStateForTest()
+	t.Cleanup(resetPluginStateForTest)
+
+	// 1. Non-Mistral model (gpt-5) with plain text content array MUST remain untouched.
+	gptBody := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}]}`)
+	gptEnv := callPluginMethodForTest(t, "response.normalize_before", map[string]any{
+		"FromFormat": "openai",
+		"ToFormat":   "openai",
+		"Model":      "gpt-5",
+		"Stream":     false,
+		"Body":       gptBody,
+	})
+	var gptResp payloadResp
+	if err := json.Unmarshal(gptEnv.Result, &gptResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(gptResp.Body) != 0 {
+		t.Fatalf("expected non-Mistral text-only content array untouched, got: %s", gptResp.Body)
+	}
+
+	// 2. Mistral-family model with plain text content array MUST still be flattened.
+	misTextBody := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}]}`)
+	misEnv := callPluginMethodForTest(t, "response.normalize_before", map[string]any{
+		"FromFormat": "openai",
+		"ToFormat":   "openai",
+		"Model":      "mistral-small-latest",
+		"Stream":     false,
+		"Body":       misTextBody,
+	})
+	var misResp payloadResp
+	if err := json.Unmarshal(misEnv.Result, &misResp); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(misResp.Body, []byte(`"content":"hello"`)) {
+		t.Fatalf("expected Mistral text-only content array flattened, got: %s", misResp.Body)
+	}
+
+	// 3. Unknown/alias model on a confirmed Mistral credential with text-only content array MUST be flattened.
+	discoveredMu.Lock()
+	mistralCredIDs["openai-compatibility:mistral:aaa"] = true
+	knownCredIDs["openai-compatibility:mistral:aaa"] = true
+	discoveredMu.Unlock()
+	_ = callPluginMethodForTest(t, "request.intercept_after", map[string]any{
+		"SourceFormat":   "openai",
+		"ToFormat":       "openai",
+		"Model":          "zai-glm-5-3",
+		"RequestedModel": "zai-glm-5-3",
+		"Body":           []byte(`{"model":"zai-glm-5-3","messages":[{"role":"user","content":"hi"}]}`),
+		"Metadata":       map[string]any{"selected_auth_id": "openai-compatibility:mistral:aaa"},
+	})
+	glmEnv := callPluginMethodForTest(t, "response.normalize_before", map[string]any{
+		"FromFormat": "openai",
+		"ToFormat":   "openai",
+		"Model":      "zai-glm-5-3",
+		"Stream":     false,
+		"Body":       misTextBody,
+	})
+	var glmResp payloadResp
+	if err := json.Unmarshal(glmEnv.Result, &glmResp); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(glmResp.Body, []byte(`"content":"hello"`)) {
+		t.Fatalf("expected credential-confirmed zai-glm-5-3 text-only array flattened, got: %s", glmResp.Body)
+	}
+
+	// 4. Mistral thinking array on non-pattern model (e.g. deepseek-v4-1-flash-1017 without prior intercept) MUST still flatten.
+	dsThinkBody := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":[{"type":"thinking","thinking":[{"type":"text","text":"step"}]},{"type":"text","text":"ans"}]}}]}`)
+	dsEnv := callPluginMethodForTest(t, "response.normalize_before", map[string]any{
+		"FromFormat": "openai",
+		"ToFormat":   "openai",
+		"Model":      "deepseek-v4-1-flash-1017",
+		"Stream":     false,
+		"Body":       dsThinkBody,
+	})
+	var dsResp payloadResp
+	if err := json.Unmarshal(dsEnv.Result, &dsResp); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(dsResp.Body, []byte(`"reasoning_content":"step"`)) || !bytes.Contains(dsResp.Body, []byte(`"content":"ans"`)) {
+		t.Fatalf("expected Mistral thinking chunk flattened on deepseek, got: %s", dsResp.Body)
+	}
+}
+
+func TestPluginReconfigure_EmptyPayloadResetsToDefaults(t *testing.T) {
+	resetPluginStateForTest()
+	t.Cleanup(resetPluginStateForTest)
+
+	callPluginMethodForTest(t, "plugin.reconfigure", map[string]any{
+		"config_yaml": []byte("enabled: false\nnormalize_tool_call_ids: false\n"),
+	})
+	if getConfig().Enabled {
+		t.Fatal("expected enabled=false after custom reconfigure")
+	}
+
+	// Empty payload or nil reqBytes resets back to DefaultConfig().
+	rawOut, err := handleMethod("plugin.reconfigure", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	_ = json.Unmarshal(rawOut, &env)
+	if !env.OK {
+		t.Fatalf("empty reconfigure failed: %+v", env.Error)
+	}
+	cfg := getConfig()
+	if !cfg.Enabled || !cfg.NormalizeToolCallIDs {
+		t.Fatalf("expected empty reconfigure to reset to defaults, got %+v", cfg)
 	}
 }
